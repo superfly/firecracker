@@ -41,8 +41,10 @@ const DEV_NULL_WITH_NUL: &[u8] = b"/dev/null\0";
 // We need /run for the default location of the api socket.
 // Since libc::chown is not recursive, we cannot specify only /dev/net as we want
 // to walk through the entire folder hierarchy.
-const FOLDER_HIERARCHY: [&[u8]; 4] = [b"/\0", b"/dev\0", b"/dev/net\0", b"/run\0"];
+const FOLDER_HIERARCHY: [&[u8]; 3] = [b"/dev\0", b"/dev/net\0", b"/run\0"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
+const ROOT_FOLDER: &[u8] = b"/\0";
+const ROOT_FOLDER_PERMISSIONS: u32 = 0o750;
 
 // Helper function, since we'll use libc::dup2 a bunch of times for daemonization.
 fn dup2(old_fd: libc::c_int, new_fd: libc::c_int) -> Result<()> {
@@ -221,14 +223,14 @@ impl Env {
             .map_err(|e| Error::ChangeFileOwner(PathBuf::from(dev_path.to_str().unwrap()), e))
     }
 
-    fn setup_jailed_folder(&self, folder: &[u8]) -> Result<()> {
+    fn setup_jailed_folder(&self, folder: &[u8], permissions: u32) -> Result<()> {
         let folder_cstr = CStr::from_bytes_with_nul(folder).map_err(Error::FromBytesWithNul)?;
 
         // Safe to unwrap as the byte sequence is UTF-8 validated above.
         let path = folder_cstr.to_str().unwrap();
         let path_buf = PathBuf::from(path);
         fs::create_dir_all(path).map_err(|e| Error::CreateDir(path_buf.clone(), e))?;
-        fs::set_permissions(path, Permissions::from_mode(FOLDER_PERMISSIONS))
+        fs::set_permissions(path, Permissions::from_mode(permissions))
             .map_err(|e| Error::Chmod(path_buf.clone(), e))?;
 
         #[cfg(target_arch = "x86_64")]
@@ -386,11 +388,14 @@ impl Env {
         // Jail self.
         chroot(self.chroot_dir())?;
 
+        // Change ownership for root folder first
+        self.setup_jailed_folder(ROOT_FOLDER, ROOT_FOLDER_PERMISSIONS)?;
+
         // This will not only create necessary directories, but will also change ownership
         // for all of them.
         FOLDER_HIERARCHY
             .iter()
-            .map(|f| self.setup_jailed_folder(*f))
+            .map(|f| self.setup_jailed_folder(*f, FOLDER_PERMISSIONS))
             .collect::<Result<()>>()?;
 
         // Here we are creating the /dev/kvm and /dev/net/tun devices inside the jailer.
@@ -660,7 +665,7 @@ mod tests {
         // Error case: non UTF-8 paths.
         let bad_string: &[u8] = &[0, 102, 111, 111, 0]; // A leading nul followed by 'f', 'o', 'o'
         assert_eq!(
-            format!("{}", env.setup_jailed_folder(bad_string).err().unwrap()),
+            format!("{}", env.setup_jailed_folder(bad_string, FOLDER_PERMISSIONS).err().unwrap()),
             "Failed to decode string from byte array: data provided contains an interior nul byte at byte pos 0"
         );
 
@@ -675,7 +680,9 @@ mod tests {
         let mut foo_path = foo_dir.as_path().as_os_str().as_bytes().to_vec();
         foo_path.push(0);
         foo_dir.remove().unwrap();
-        assert!(env.setup_jailed_folder(foo_path.as_slice()).is_ok());
+        assert!(env
+            .setup_jailed_folder(foo_path.as_slice(), FOLDER_PERMISSIONS)
+            .is_ok());
 
         let metadata = fs::metadata(
             CStr::from_bytes_with_nul(foo_path.as_slice())
