@@ -59,8 +59,10 @@ const DEV_UFFD_MAJOR: u32 = 10;
 // We need /run for the default location of the api socket.
 // Since libc::chown is not recursive, we cannot specify only /dev/net as we want
 // to walk through the entire folder hierarchy.
-const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
+const FOLDER_HIERARCHY: [&str; 3] = ["/dev", "/dev/net", "/run"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
+const ROOT_FOLDER: &str = "/";
+const ROOT_FOLDER_PERMISSIONS: u32 = 0o750;
 
 // When running with `--new-pid-ns` flag, the PID of the process running the exec_file differs
 // from jailer's and it is stored inside a dedicated file, prefixed with the below extension.
@@ -442,11 +444,15 @@ impl Env {
             })
     }
 
-    fn setup_jailed_folder(&self, folder: impl AsRef<Path>) -> Result<(), JailerError> {
+    fn setup_jailed_folder(
+        &self,
+        folder: impl AsRef<Path>,
+        permissions: u32,
+    ) -> Result<(), JailerError> {
         let folder_path = folder.as_ref();
         fs::create_dir_all(folder_path)
             .map_err(|err| JailerError::CreateDir(folder_path.to_owned(), err))?;
-        fs::set_permissions(folder_path, Permissions::from_mode(FOLDER_PERMISSIONS))
+        fs::set_permissions(folder_path, Permissions::from_mode(permissions))
             .map_err(|err| JailerError::Chmod(folder_path.to_owned(), err))?;
 
         let c_path = CString::new(folder_path.to_str().unwrap()).unwrap();
@@ -641,11 +647,14 @@ impl Env {
         // Jail self.
         chroot(self.chroot_dir())?;
 
+        // Change ownership for root folder first
+        self.setup_jailed_folder(ROOT_FOLDER, ROOT_FOLDER_PERMISSIONS)?;
+
         // This will not only create necessary directories, but will also change ownership
         // for all of them.
         FOLDER_HIERARCHY
             .iter()
-            .try_for_each(|f| self.setup_jailed_folder(f))?;
+            .try_for_each(|f| self.setup_jailed_folder(f, FOLDER_PERMISSIONS))?;
 
         // Here we are creating the /dev/kvm and /dev/net/tun devices inside the jailer.
         // Following commands can be translated into bash like this:
@@ -1063,7 +1072,12 @@ mod tests {
         let bad_string_bytes: Vec<u8> = vec![0, 102, 111, 111, 0]; // A leading nul followed by 'f', 'o', 'o'
         let bad_string = String::from_utf8(bad_string_bytes).unwrap();
         assert_eq!(
-            format!("{}", env.setup_jailed_folder(bad_string).err().unwrap()),
+            format!(
+                "{}",
+                env.setup_jailed_folder(bad_string, FOLDER_PERMISSIONS)
+                    .err()
+                    .unwrap()
+            ),
             format!(
                 "Failed to create directory \\0foo\\0: file name contained an unexpected NUL byte"
             )
@@ -1077,7 +1091,8 @@ mod tests {
 
         // Success case.
         let foo_dir = TempDir::new().unwrap().as_path().to_owned();
-        env.setup_jailed_folder(foo_dir.as_path()).unwrap();
+        env.setup_jailed_folder(foo_dir.as_path(), FOLDER_PERMISSIONS)
+            .unwrap();
 
         let metadata = fs::metadata(&foo_dir).unwrap();
         // The mode bits will also have S_IFDIR set because the path belongs to a directory.
