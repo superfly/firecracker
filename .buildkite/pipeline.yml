@@ -1,7 +1,7 @@
 steps:
   - label: "build"
     commands:
-      - tools/devtool build --release
+      - tools/devtool -y build --release
     agents:
       queue: "high-concurrency"
     artifacts:
