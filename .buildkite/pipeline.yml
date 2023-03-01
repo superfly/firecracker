@@ -2,6 +2,9 @@ steps:
   - label: "build"
     commands:
       - tools/devtool -y build --release
+      - aws s3 cp build/cargo_target/x86_64-unknown-linux-musl/release/firecracker s3://flyio-builds/firecracker/${BUILDKITE_BRANCH}/firecracker --region us-east-2 &
+      - aws s3 cp build/cargo_target/x86_64-unknown-linux-musl/release/jailer s3://flyio-builds/firecracker/${BUILDKITE_BRANCH}/jailer --region us-east-2 &
+      - wait
     agents:
       queue: "high-concurrency"
     artifacts:
