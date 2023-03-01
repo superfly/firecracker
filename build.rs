@@ -21,7 +21,7 @@ fn main() {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
     println!(
-        "cargo:rustc-env=FIRECRACKER_VERSION={}",
+        "cargo:rustc-env=FIRECRACKER_VERSION={}-fly",
         firecracker_version
     );
 }
