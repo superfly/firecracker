@@ -310,7 +310,7 @@ impl VsockMuxer {
             .map_err(Error::UnixBind)?;
 
         let chmod_res =
-            unsafe { libc::chmod(host_sock_path.as_ptr() as *const i8, 0770 as libc::mode_t) };
+            unsafe { libc::chmod(host_sock_path.as_ptr() as *const i8, 0o770 as libc::mode_t) };
         if chmod_res == -1 {
             return Err(Error::UnixConnect(std::io::Error::last_os_error()));
         }
