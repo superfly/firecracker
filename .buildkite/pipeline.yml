@@ -1,0 +1,9 @@
+steps:
+  - label: "build"
+    commands:
+      - tools/devtool build --release
+    agents:
+      queue: "high-concurrency"
+    artifacts:
+      - build/cargo_target/x86_64-unknown-linux-musl/release/firecracker
+      - build/cargo_target/x86_64-unknown-linux-musl/release/jailer
