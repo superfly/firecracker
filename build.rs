@@ -20,8 +20,21 @@ fn main() {
         .map(|version_string| version_string.trim_start_matches('v').to_string())
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
+    let commit_hash = Command::new("git")
+        .args(&["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                return Some(output.stdout);
+            }
+            None
+        })
+        .and_then(|version_bytes| String::from_utf8(version_bytes).ok())
+        .unwrap_or_else(|| "".to_string());
+
     println!(
-        "cargo:rustc-env=FIRECRACKER_VERSION={}-fly",
-        firecracker_version
+        "cargo:rustc-env=FIRECRACKER_VERSION={}-fly-{}",
+        firecracker_version, commit_hash
     );
 }
