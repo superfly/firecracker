@@ -329,7 +329,7 @@ impl Env {
             .unwrap()
             .to_string();
 
-        if !exec_file_name.contains("firecracker") {
+        if !exec_file_name.contains("fire") {
             return Err(JailerError::ExecFileName(exec_file_name));
         }
 
