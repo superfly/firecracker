@@ -31,7 +31,9 @@
 ///    mapping `RawFd`s to `EpollListener`s.
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::fs;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -308,13 +310,8 @@ impl VsockMuxer {
             .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
             .map_err(VsockUnixBackendError::UnixBind)?;
 
-        let chmod_res =
-            unsafe { libc::chmod(host_sock_path.as_ptr() as *const i8, 0o770 as libc::mode_t) };
-        if chmod_res == -1 {
-            return Err(VsockUnixBackendError::UnixConnect(
-                std::io::Error::last_os_error(),
-            ));
-        }
+        fs::set_permissions(&host_sock_path, fs::Permissions::from_mode(0o770))
+            .map_err(VsockUnixBackendError::UnixConnect)?;
 
         let mut muxer = Self {
             cid,
