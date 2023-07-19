@@ -1,0 +1,18 @@
+steps:
+  - label: "build"
+    commands:
+      # tools/devtool uses 'git describe' that doesn't work without annotated tags.
+      - git config user.email 'alan@example.com'
+      - git config user.name 'Alan Smithee'
+      - git tag --annotate v1.3.x 72ced53bb7e0385ea0ed6689b1e5a61873591db8 -m 'dummy' --force
+      # Build Firecracker
+      - tools/devtool -y build --release
+      # Upload binaries
+      - aws s3 cp build/cargo_target/x86_64-unknown-linux-musl/release/firecracker s3://flyio-builds/firecracker/${BUILDKITE_BRANCH}/firecracker --region us-east-2 &
+      - aws s3 cp build/cargo_target/x86_64-unknown-linux-musl/release/jailer s3://flyio-builds/firecracker/${BUILDKITE_BRANCH}/jailer --region us-east-2 &
+      - wait
+    agents:
+      queue: "high-concurrency"
+    artifacts:
+      - build/cargo_target/x86_64-unknown-linux-musl/release/firecracker
+      - build/cargo_target/x86_64-unknown-linux-musl/release/jailer
