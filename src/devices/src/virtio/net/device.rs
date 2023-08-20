@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::{cmp, mem, result};
 use utils::eventfd::EventFd;
 use utils::net::mac::{MacAddr, MAC_ADDR_LEN};
+use virtio_gen::virtio_net::VIRTIO_NET_F_GSO;
 use virtio_gen::virtio_net::VIRTIO_NET_F_GUEST_TSO6;
 use virtio_gen::virtio_net::VIRTIO_NET_F_HOST_TSO6;
 use virtio_gen::virtio_net::{
@@ -161,6 +162,7 @@ impl Net {
             | 1 << VIRTIO_NET_F_HOST_TSO4
             | 1 << VIRTIO_NET_F_HOST_TSO6
             | 1 << VIRTIO_NET_F_HOST_UFO
+            | 1 << VIRTIO_NET_F_GSO
             | 1 << VIRTIO_F_VERSION_1;
 
         let mut config_space = ConfigSpace::default();
@@ -933,6 +935,7 @@ pub mod tests {
             | 1 << VIRTIO_NET_F_HOST_TSO4
             | 1 << VIRTIO_NET_F_HOST_TSO6
             | 1 << VIRTIO_NET_F_HOST_UFO
+            | 1 << VIRTIO_NET_F_GSO
             | 1 << VIRTIO_F_VERSION_1;
 
         assert_eq!(net.avail_features_by_page(0), features as u32);
