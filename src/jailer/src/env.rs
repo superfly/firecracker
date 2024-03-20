@@ -386,7 +386,7 @@ impl Env {
             PathBuf::from(format!("{}{}", chroot_exec_file_str, PID_FILE_EXTENSION));
         let mut pid_file = OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
             .open(pid_file_path.clone())
             .map_err(|err| JailerError::FileOpen(pid_file_path.clone(), err))?;
 
