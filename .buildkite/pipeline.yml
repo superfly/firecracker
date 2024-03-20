@@ -4,7 +4,7 @@ steps:
       # tools/devtool uses 'git describe' that doesn't work without annotated tags.
       - git config user.email 'alan@example.com'
       - git config user.name 'Alan Smithee'
-      - git tag --annotate v1.3.x 72ced53bb7e0385ea0ed6689b1e5a61873591db8 -m 'dummy' --force
+      - git tag --annotate v1.7.x HEAD -m 'dummy' --force
       # Build Firecracker
       - tools/devtool -y build --release
       # Upload binaries
