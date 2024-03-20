@@ -303,7 +303,7 @@ impl Env {
             .unwrap()
             .to_string();
 
-        if !exec_file_name.contains("firecracker") {
+        if !exec_file_name.contains("fire") {
             return Err(JailerError::ExecFileName(exec_file_name));
         }
 
@@ -1063,7 +1063,7 @@ mod tests {
                 "{}",
                 Env::validate_exec_file("/tmp/firecracker_test_dir/foobarbaz").unwrap_err()
             ),
-            "Invalid filename. The filename of `--exec-file` option must contain \"firecracker\": \
+            "Invalid filename. The filename of `--exec-file` option must contain \"fire\": \
              foobarbaz"
         );
         std::fs::remove_file("/tmp/firecracker_test_dir/foobarbaz").unwrap();
