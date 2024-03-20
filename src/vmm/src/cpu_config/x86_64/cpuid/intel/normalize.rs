@@ -20,6 +20,8 @@ pub enum NormalizeCpuidError {
     MissingLeaf7,
     /// Leaf 0xA is missing from CPUID.
     MissingLeafA,
+    /// Missing leaf 0x40000001.
+    MissingLeaf0x40000001,
     /// Failed to get brand string: {0}
     GetBrandString(DefaultBrandStringError),
     /// Failed to set brand string: {0}
@@ -74,6 +76,7 @@ impl super::IntelCpuid {
         self.update_extended_feature_flags_entry()?;
         self.update_performance_monitoring_entry()?;
         self.update_brand_string_entry()?;
+        self.disable_kvm_async_pf_int()?;
 
         Ok(())
     }
@@ -223,6 +226,18 @@ impl super::IntelCpuid {
 
         self.apply_brand_string(&default_brand_string)
             .map_err(NormalizeCpuidError::ApplyBrandString)?;
+        Ok(())
+    }
+
+    /// Disables the KVM feature "async page fault interrupt" in the CPUID.
+    fn disable_kvm_async_pf_int(&mut self) -> Result<(), NormalizeCpuidError> {
+        // Get the KVM_CPUID_FEATURES leaf (0x40000001).
+        let leaf_40000001 = self
+            .get_mut(&CpuidKey::leaf(0x40000001))
+            .ok_or(NormalizeCpuidError::MissingLeaf0x40000001)?;
+
+        // Set the bit 14 (KVM_FEATURE_ASYNC_PF_INT) to 0.
+        set_bit(&mut leaf_40000001.result.eax, 14, false);
         Ok(())
     }
 }
