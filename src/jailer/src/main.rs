@@ -76,6 +76,8 @@ pub enum JailerError {
     Dup2(io::Error),
     #[error("Failed to exec into Firecracker: {0}")]
     Exec(io::Error),
+    #[error("Invalid filename. The filename of `--exec-file` option must contain \"fire\": {0}")]
+    ExecFileName(String),
     #[error("{}", format!("Failed to extract filename from path {:?}", .0).replace('\"', ""))]
     ExtractFileName(PathBuf),
     #[error("{}", format!("Failed to open file {:?}: {}", .0, .1).replace('\"', ""))]

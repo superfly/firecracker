@@ -303,6 +303,10 @@ impl Env {
             .unwrap()
             .to_string();
 
+        if !exec_file_name.contains("fire") {
+            return Err(JailerError::ExecFileName(exec_file_name));
+        }
+
         Ok((exec_file_path, exec_file_name))
     }
 
@@ -1084,6 +1088,17 @@ mod tests {
             "/tmp/firecracker_test_dir is not a file"
         );
 
+        // Error case 3: Filename without "firecracker"
+        File::create("/tmp/firecracker_test_dir/foobarbaz").unwrap();
+        assert_eq!(
+            format!(
+                "{}",
+                Env::validate_exec_file("/tmp/firecracker_test_dir/foobarbaz").unwrap_err()
+            ),
+            "Invalid filename. The filename of `--exec-file` option must contain \"fire\": \
+             foobarbaz"
+        );
+        std::fs::remove_file("/tmp/firecracker_test_dir/foobarbaz").unwrap();
         std::fs::remove_dir_all("/tmp/firecracker_test_dir").unwrap();
     }
 
