@@ -227,6 +227,16 @@ pub trait Cgroup: Debug {
 // writing to /A/<parent_cgroup>/file, but we can still continue, because step 4) only cares about
 // the file no longer being empty, regardless of who actually got to populated its contents.
 
+// This can be skipped for blkio.throttle.* cgroups. For now, we specify a list of cgroups to skip
+// the inherit process for.
+
+const CGROUPS_SKIP_INHERIT: [&'static str; 4] = [
+    "blkio.throttle.read_iops_device",
+    "blkio.throttle.read_bps_device",
+    "blkio.throttle.write_iops_device",
+    "blkio.throttle.write_bps_device",
+];
+
 fn inherit_from_parent_aux(
     path: &mut PathBuf,
     file_name: &str,
@@ -321,9 +331,13 @@ impl Cgroup for CgroupV1 {
         fs::create_dir_all(&self.base.location)
             .map_err(|err| JailerError::CreateDir(self.base.location.clone(), err))?;
 
-        // Write the corresponding cgroup value. inherit_from_parent is used to
-        // correctly propagate the value if not defined.
-        inherit_from_parent(location, &self.base.file, self.cg_parent_depth)?;
+        // Do we need to clone it?
+        if !CGROUPS_SKIP_INHERIT.contains(&self.base.file.clone().as_str()) {
+            // Write the corresponding cgroup value. inherit_from_parent is used to
+            // correctly propagate the value if not defined.
+            inherit_from_parent(location, &self.base.file, self.cg_parent_depth)?;
+        }
+
         location.push(&self.base.file);
         writeln_special(location, &self.base.value)?;
 
