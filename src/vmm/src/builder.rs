@@ -766,6 +766,8 @@ pub fn configure_system_for_boot(
             .configure(vmm.guest_memory(), entry_addr, &vcpu_config)
             .map_err(VmmError::VcpuConfigure)
             .map_err(Internal)?;
+
+        vcpu.kvm_vcpu.set_tsc_khz(1_000_000_000);
     }
 
     #[cfg(target_arch = "x86_64")]
