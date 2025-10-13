@@ -1662,6 +1662,7 @@ dependencies = [
  "event-manager",
  "gdbstub",
  "gdbstub_arch",
+ "getrandom 0.3.4",
  "itertools 0.15.0",
  "kvm-bindings",
  "kvm-ioctls",
