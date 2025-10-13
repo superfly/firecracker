@@ -315,6 +315,12 @@ impl VsockMuxer {
         fs::set_permissions(&host_sock_path, fs::Permissions::from_mode(0o770))
             .map_err(VsockUnixBackendError::UnixConnect)?;
 
+        // Start with a random local port so we don't reuse the same ports on snapshot restore.
+        // Connections are closed across snapshot/restore, but if the guest processes
+        // haven't yet handled the error and actually called close, any connection attempts
+        // that use the same client port will be reset by the guest kernel.
+        let local_port_last = getrandom::u32().unwrap() & !(1 << 31) | (1 << 30);
+
         let mut muxer = Self {
             cid,
             host_sock,
@@ -324,7 +330,7 @@ impl VsockMuxer {
             conn_map: HashMap::with_capacity(defs::MAX_CONNECTIONS),
             listener_map: HashMap::with_capacity(defs::MAX_CONNECTIONS + 1),
             killq: MuxerKillQ::new(),
-            local_port_last: (1u32 << 30) - 1,
+            local_port_last: local_port_last,
             local_port_set: HashSet::with_capacity(defs::MAX_CONNECTIONS),
         };
 
