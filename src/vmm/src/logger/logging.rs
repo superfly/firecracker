@@ -3,6 +3,7 @@
 
 use std::fmt::Debug;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
@@ -13,7 +14,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use utils::time::LocalTime;
 
 use super::metrics::{IncMetric, METRICS};
-use crate::utils::open_file_write_nonblock;
 
 /// Default level filter for logger matching the swagger specification
 /// (`src/firecracker/swagger/firecracker.yaml`).
@@ -62,7 +62,11 @@ impl Logger {
         );
 
         if let Some(log_path) = config.log_path {
-            let file = open_file_write_nonblock(&log_path).map_err(LoggerUpdateError)?;
+            let file = std::fs::OpenOptions::new()
+                .custom_flags(libc::O_NONBLOCK)
+                .write(true)
+                .open(log_path)
+                .map_err(LoggerUpdateError)?;
 
             guard.target = Some(file);
         };
