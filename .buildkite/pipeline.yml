@@ -11,4 +11,6 @@ steps:
       queue: "high-concurrency"
     artifacts:
       - build/cargo_target/x86_64-unknown-linux-musl/release/firecracker
+      - build/cargo_target/x86_64-unknown-linux-musl/release/firecracker.debug
       - build/cargo_target/x86_64-unknown-linux-musl/release/jailer
+      - build/cargo_target/x86_64-unknown-linux-musl/release/jailer.debug

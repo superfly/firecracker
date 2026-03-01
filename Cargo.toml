@@ -35,6 +35,7 @@ or_fun_call = "warn"
 panic = "abort"
 
 [profile.release]
+debug = true
 panic = "abort"
 lto = true
 strip = "none"
