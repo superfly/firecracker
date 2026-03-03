@@ -60,6 +60,8 @@ pub struct BlockDeviceConfig {
     // pub file_engine_type: FileEngineType,
     #[serde(rename = "io_engine")]
     pub file_engine_type: Option<FileEngineType>,
+    /// If set to true, the drive is opened with O_DIRECT.
+    pub is_direct: Option<bool>,
 
     // VhostUserBlock specific fields
     /// Path to the vhost-user socket.
