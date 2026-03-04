@@ -26,6 +26,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 pub use crate::arch::{ArchVm as Vm, ArchVmError, VmState};
 use crate::arch::{GSI_MSI_END, host_page_size};
+use crate::signal_handler::SNAPSHOT_CANCELLED;
 use crate::logger::info;
 use crate::pci::{DeviceRelocation, DeviceRelocationError, PciDevice};
 use crate::persist::CreateSnapshotError;
@@ -381,7 +382,7 @@ impl Vm {
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
             SnapshotType::Full => {
-                self.guest_memory().dump(&mut file)?;
+                self.guest_memory().dump(&mut file, &SNAPSHOT_CANCELLED)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }

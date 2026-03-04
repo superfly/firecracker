@@ -8,6 +8,7 @@
 use std::fs::File;
 use std::io::SeekFrom;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bitvec::vec::BitVec;
@@ -71,6 +72,8 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
+    /// Snapshot operation was cancelled
+    Cancelled,
 }
 
 impl From<vm_memory::VolatileMemoryError> for MemoryError {
@@ -603,7 +606,11 @@ where
     fn mark_dirty(&self, addr: GuestAddress, len: usize);
 
     /// Dumps all contents of GuestMemoryMmap to a writer.
-    fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
+    fn dump<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        cancel_flag: &AtomicBool,
+    ) -> Result<(), MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
@@ -688,7 +695,14 @@ impl GuestMemoryExtension for GuestMemoryMmap {
     }
 
     /// Dumps all contents of GuestMemoryMmap to a writer.
-    fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError> {
+    fn dump<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        cancel_flag: &AtomicBool,
+    ) -> Result<(), MemoryError> {
+        // Write in 4MB chunks to allow for cancellation checks
+        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
         self.iter()
             .flat_map(|region| region.slots())
             .try_for_each(|(mem_slot, plugged)| {
@@ -696,11 +710,20 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                     let ilen = i64::try_from(mem_slot.slice.len()).unwrap();
                     writer.seek(SeekFrom::Current(ilen)).unwrap();
                 } else {
-                    writer.write_all_volatile(&mem_slot.slice)?;
+                    let total_len = mem_slot.slice.len();
+                    (0..total_len).step_by(CHUNK_SIZE).try_for_each(|offset| {
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            return Err(MemoryError::Cancelled);
+                        }
+                        let chunk_len = std::cmp::min(CHUNK_SIZE, total_len - offset);
+                        let chunk = mem_slot.slice.subslice(offset, chunk_len)?;
+                        writer
+                            .write_all_volatile(&chunk)
+                            .map_err(|e| MemoryError::WriteMemory(e.into()))
+                    })?;
                 }
                 Ok(())
             })
-            .map_err(MemoryError::WriteMemory)
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -1129,7 +1152,8 @@ mod tests {
 
         // dump the full memory.
         let mut memory_file = TempFile::new().unwrap().into_file();
-        guest_memory.dump(&mut memory_file).unwrap();
+        let cancel_flag = AtomicBool::new(false);
+        guest_memory.dump(&mut memory_file, &cancel_flag).unwrap();
 
         let restored_guest_memory =
             into_region_ext(snapshot_file(memory_file, memory_state.regions(), false).unwrap());

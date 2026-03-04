@@ -1,10 +1,16 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use libc::{
-    SIGBUS, SIGHUP, SIGILL, SIGPIPE, SIGSEGV, SIGSYS, SIGXCPU, SIGXFSZ, c_int, c_void, siginfo_t,
+    SIGBUS, SIGHUP, SIGILL, SIGPIPE, SIGSEGV, SIGSYS, SIGUSR1, SIGXCPU, SIGXFSZ, c_int, c_void,
+    siginfo_t,
 };
 use log::error;
+
+/// Flag set by SIGUSR1 handler to cancel in-progress snapshot
+pub static SNAPSHOT_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 use crate::FcExitCode;
 use crate::logger::{IncMetric, METRICS, StoreMetric};
@@ -150,10 +156,15 @@ extern "C" fn sigpipe_handler(num: c_int, info: *mut siginfo_t, _unused: *mut c_
     error!("Received signal {}, code {}.", si_signo, si_code);
 }
 
+#[inline(always)]
+extern "C" fn sigusr1_handler(_num: c_int, _info: *mut siginfo_t, _unused: *mut c_void) {
+    SNAPSHOT_CANCELLED.store(true, Ordering::SeqCst);
+}
+
 /// Registers all the required signal handlers.
 ///
 /// Custom handlers are installed for: `SIGBUS`, `SIGSEGV`, `SIGSYS`
-/// `SIGXFSZ` `SIGXCPU` `SIGPIPE` `SIGHUP` and `SIGILL`.
+/// `SIGXFSZ` `SIGXCPU` `SIGPIPE` `SIGHUP`, `SIGILL`, and `SIGUSR1`.
 pub fn register_signal_handlers() -> vmm_sys_util::errno::Result<()> {
     // Call to unsafe register_signal_handler which is considered unsafe because it will
     // register a signal handler which will be called in the current thread and will interrupt
@@ -167,5 +178,6 @@ pub fn register_signal_handlers() -> vmm_sys_util::errno::Result<()> {
     register_signal_handler(SIGPIPE, sigpipe_handler)?;
     register_signal_handler(SIGHUP, sighup_handler)?;
     register_signal_handler(SIGILL, sigill_handler)?;
+    register_signal_handler(SIGUSR1, sigusr1_handler)?;
     Ok(())
 }

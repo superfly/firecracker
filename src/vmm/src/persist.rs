@@ -144,6 +144,8 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Snapshot was cancelled by signal
+    Cancelled,
 }
 
 /// Snapshot version

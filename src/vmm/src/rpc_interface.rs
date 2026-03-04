@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::{self, Debug};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
@@ -21,6 +22,7 @@ use crate::mmds::data_store::{self, Mmds};
 use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
+use crate::signal_handler::SNAPSHOT_CANCELLED;
 use crate::vmm_config::balloon::{
     BalloonConfigError, BalloonDeviceConfig, BalloonStats, BalloonUpdateConfig,
     BalloonUpdateStatsConfig,
@@ -798,6 +800,9 @@ impl RuntimeApiController {
 
     /// Pauses the microVM by pausing the vCPUs.
     pub fn pause(&mut self) -> Result<VmmData, VmmActionError> {
+        // Reset snapshot cancellation flag in anticipation of a snapshot being taken
+        SNAPSHOT_CANCELLED.store(false, Ordering::SeqCst);
+
         let pause_start_us = get_time_us(ClockType::Monotonic);
 
         self.vmm.lock().expect("Poisoned lock").pause_vm()?;
