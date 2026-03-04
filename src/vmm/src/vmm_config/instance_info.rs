@@ -4,6 +4,13 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::{Serialize, ser};
 
+/// Capabilities that this Firecracker instance supports.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Capabilities {
+    /// Whether SIGUSR1 can cancel an in-progress snapshot
+    pub snapshot_cancel: bool,
+}
+
 /// Enumerates microVM runtime states.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum VmState {
@@ -46,4 +53,6 @@ pub struct InstanceInfo {
     pub vmm_version: String,
     /// The name of the application that runs the microVM.
     pub app_name: String,
+    /// Capabilities supported by this Firecracker instance.
+    pub capabilities: Capabilities,
 }

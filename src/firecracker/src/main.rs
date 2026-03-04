@@ -29,7 +29,7 @@ use vmm::resources::VmResources;
 use vmm::seccomp::BpfThreadMap;
 use vmm::signal_handler::register_signal_handlers;
 use vmm::snapshot::{SnapshotError, get_format_version};
-use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
+use vmm::vmm_config::instance_info::{Capabilities, InstanceInfo, VmState};
 use vmm::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics};
 use vmm::{EventManager, FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
 use vmm_sys_util::terminal::Terminal;
@@ -347,6 +347,9 @@ fn main_exec() -> Result<(), MainError> {
         state: VmState::NotStarted,
         vmm_version: FIRECRACKER_VERSION.to_string(),
         app_name: "Firecracker".to_string(),
+        capabilities: Capabilities {
+            snapshot_cancel: true,
+        },
     };
 
     if let Some(metrics_path) = arguments.single_value("metrics-path") {

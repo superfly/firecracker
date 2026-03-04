@@ -13,7 +13,7 @@ use vmm::builder::{StartMicrovmError, build_microvm_for_boot};
 use vmm::cpu_config::templates::{CustomCpuTemplate, Numeric};
 use vmm::resources::VmResources;
 use vmm::seccomp::get_empty_filters;
-use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
+use vmm::vmm_config::instance_info::{Capabilities, InstanceInfo, VmState};
 use vmm::{EventManager, HTTP_MAX_PAYLOAD_SIZE, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
@@ -125,6 +125,7 @@ pub fn build_microvm_from_config(
         state: VmState::NotStarted,
         vmm_version: CPU_TEMPLATE_HELPER_VERSION.to_string(),
         app_name: "cpu-template-helper".to_string(),
+        capabilities: Capabilities::default(),
     };
     let mut vm_resources =
         VmResources::from_json(&config, &instance_info, HTTP_MAX_PAYLOAD_SIZE, None)
