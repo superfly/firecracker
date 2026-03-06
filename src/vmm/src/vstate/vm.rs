@@ -336,6 +336,7 @@ impl Vm {
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
+        chunk_size: Option<usize>,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -382,7 +383,8 @@ impl Vm {
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
             SnapshotType::Full => {
-                self.guest_memory().dump(&mut file, &SNAPSHOT_CANCELLED)?;
+                self.guest_memory()
+                    .dump(&mut file, &SNAPSHOT_CANCELLED, chunk_size)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }

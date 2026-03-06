@@ -610,6 +610,7 @@ where
         &self,
         writer: &mut T,
         cancel_flag: &AtomicBool,
+        chunk_size: Option<usize>,
     ) -> Result<(), MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -699,9 +700,10 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         &self,
         writer: &mut T,
         cancel_flag: &AtomicBool,
+        chunk_size: Option<usize>,
     ) -> Result<(), MemoryError> {
-        // Write in 4MB chunks to allow for cancellation checks
-        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+        // Write in chunks to allow for cancellation checks (default 4MB)
+        let chunk_size = chunk_size.unwrap_or(4 * 1024 * 1024);
 
         self.iter()
             .flat_map(|region| region.slots())
@@ -711,11 +713,11 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                     writer.seek(SeekFrom::Current(ilen)).unwrap();
                 } else {
                     let total_len = mem_slot.slice.len();
-                    (0..total_len).step_by(CHUNK_SIZE).try_for_each(|offset| {
+                    (0..total_len).step_by(chunk_size).try_for_each(|offset| {
                         if cancel_flag.load(Ordering::Relaxed) {
                             return Err(MemoryError::Cancelled);
                         }
-                        let chunk_len = std::cmp::min(CHUNK_SIZE, total_len - offset);
+                        let chunk_len = std::cmp::min(chunk_size, total_len - offset);
                         let chunk = mem_slot.slice.subslice(offset, chunk_len)?;
                         writer
                             .write_all_volatile(&chunk)
@@ -1153,7 +1155,7 @@ mod tests {
         // dump the full memory.
         let mut memory_file = TempFile::new().unwrap().into_file();
         let cancel_flag = AtomicBool::new(false);
-        guest_memory.dump(&mut memory_file, &cancel_flag).unwrap();
+        guest_memory.dump(&mut memory_file, &cancel_flag, None).unwrap();
 
         let restored_guest_memory =
             into_region_ext(snapshot_file(memory_file, memory_state.regions(), false).unwrap());

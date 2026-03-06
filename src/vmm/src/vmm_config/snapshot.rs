@@ -45,6 +45,10 @@ pub struct CreateSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
     pub mem_file_path: PathBuf,
+    /// Chunk size in bytes for full snapshot writes. Defaults to 4MB.
+    /// Smaller chunks allow more frequent cancellation checks.
+    #[serde(default)]
+    pub chunk_size_bytes: Option<usize>,
 }
 
 /// Allows for changing the mapping between tap devices and host devices
