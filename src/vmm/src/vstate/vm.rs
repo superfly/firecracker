@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -337,16 +338,19 @@ impl Vm {
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
         chunk_size: Option<usize>,
+        direct_io: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        if direct_io {
+            opts.custom_flags(libc::O_DIRECT);
+        }
+        let mut file = opts
             .open(mem_file_path)
             .map_err(|err| MemoryBackingFile("open", err))?;
 

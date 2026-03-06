@@ -49,6 +49,9 @@ pub struct CreateSnapshotParams {
     /// Smaller chunks allow more frequent cancellation checks.
     #[serde(default)]
     pub chunk_size_bytes: Option<usize>,
+    /// Use O_DIRECT for memory file writes to bypass page cache.
+    #[serde(default)]
+    pub direct_io: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices
