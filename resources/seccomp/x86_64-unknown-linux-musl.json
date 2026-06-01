@@ -238,6 +238,13 @@
                         "op": "eq",
                         "val": 50,
                         "comment": "libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -251,6 +258,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -264,6 +278,13 @@
                         "op": "eq",
                         "val": 34,
                         "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -277,6 +298,13 @@
                         "op": "eq",
                         "val": 32769,
                         "comment": "libc::MAP_SHARED | libc::MAP_POPULATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -487,7 +515,16 @@
             },
             {
                 "syscall": "mprotect",
-                "comment": "Used by memory hotplug to protect access to underlying host memory"
+                "comment": "Used by memory hotplug to protect access to underlying host memory",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
             }
         ]
     },
@@ -686,6 +723,13 @@
                         "op": "eq",
                         "val": 34,
                         "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -699,6 +743,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
@@ -929,6 +980,13 @@
                         "op": "eq",
                         "val": 1,
                         "comment": "libc::MAP_SHARED"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {"masked_eq": 4},
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
             },
