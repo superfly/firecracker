@@ -61,6 +61,13 @@ impl Block {
         }
     }
 
+    pub fn refresh_size(&mut self) -> Result<(), BlockError> {
+        match self {
+            Self::Virtio(b) => b.refresh_size().map_err(BlockError::VirtioBackend),
+            Self::VhostUser(_) => Err(BlockError::InvalidBlockBackend),
+        }
+    }
+
     pub fn update_rate_limiter(
         &mut self,
         bytes: BucketUpdate,

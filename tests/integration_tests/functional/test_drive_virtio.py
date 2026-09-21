@@ -5,6 +5,7 @@
 import os
 
 import pytest
+from tenacity import Retrying, stop_after_attempt, wait_fixed
 
 import host_tools.drive as drive_tools
 from framework import utils
@@ -62,6 +63,50 @@ def test_rescan_file(uvm_plain_any, io_engine):
     )
 
     _check_block_size(test_microvm.ssh, "/dev/vdb", fs.size())
+
+
+def test_refresh_size(uvm_plain_any, io_engine):
+    """Refresh capacity in place and use the added space with either IO engine."""
+    vm = uvm_plain_any
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+    fs = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "scratch"), size=2)
+    vm.add_drive("scratch", fs.path, io_engine=io_engine)
+    endpoint = vm.api.endpoint + "/drives/scratch/refresh-size"
+
+    # Capacity refresh is only available after boot.
+    assert vm.api.session.patch(endpoint).status_code == 400
+    vm.start()
+    assert (
+        vm.api.session.patch(
+            vm.api.endpoint + "/drives/missing/refresh-size"
+        ).status_code
+        == 400
+    )
+    assert vm.api.session.patch(endpoint, json={}).status_code == 400
+
+    vm.ssh.check_output("dd if=/dev/urandom of=/tmp/refresh-data bs=1M count=1")
+    for size in [3, 4, 4]:
+        os.truncate(fs.path, size * MB)
+        response = vm.api.session.patch(endpoint)
+        assert response.status_code == 204, response.text
+        for attempt in Retrying(
+            stop=stop_after_attempt(20), wait=wait_fixed(0.1), reraise=True
+        ):
+            with attempt:
+                _check_block_size(vm.ssh, "/dev/vdb", size * MB)
+
+        # Exercise IO beyond the original capacity, bypassing the guest page cache.
+        vm.ssh.check_output(
+            f"dd if=/tmp/refresh-data of=/dev/vdb bs=1M seek={size - 1} "
+            "count=1 oflag=direct"
+        )
+        vm.ssh.check_output(
+            f"dd if=/dev/vdb of=/tmp/refresh-read bs=1M skip={size - 1} "
+            "count=1 iflag=direct"
+        )
+        vm.ssh.check_output("cmp /tmp/refresh-data /tmp/refresh-read")
 
 
 def test_device_ordering(uvm_plain_any, io_engine):

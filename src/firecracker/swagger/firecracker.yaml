@@ -339,6 +339,34 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /drives/{drive_id}/refresh-size:
+    patch:
+      summary: Refreshes the capacity of a virtio block drive. Post-boot only.
+      description:
+        Reads the current size through the existing backing file descriptor, updates
+        the capacity advertised to the guest, and sends a configuration-change interrupt.
+        Does not reopen the backing path, replace the IO engine, or modify the backing file.
+        Async IO rings, registered files, and pending requests are retained.
+        The request must have no body. Vhost-user drives are not supported.
+      operationId: refreshGuestDriveSizeByID
+      parameters:
+        - name: drive_id
+          in: path
+          description: The id of the guest drive
+          required: true
+          type: string
+      responses:
+        204:
+          description: Drive capacity refreshed and guest notified
+        400:
+          description: Invalid request, unknown drive, unsupported backend, or refresh failed
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
   /pmem/{id}:
     put:
       summary: Creates or updates a pmem device. Pre-boot only.

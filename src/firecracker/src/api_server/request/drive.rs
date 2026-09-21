@@ -67,6 +67,26 @@ pub(crate) fn parse_patch_drive(
     )))
 }
 
+pub(crate) fn parse_refresh_drive_size(
+    body: Option<&Body>,
+    id_from_path: Option<&str>,
+) -> Result<ParsedRequest, RequestError> {
+    METRICS.patch_api_requests.drive_count.inc();
+    let result = (|| {
+        let id = checked_id(id_from_path.ok_or(RequestError::EmptyID)?)?;
+        if body.is_some_and(|body| !body.is_empty()) {
+            return Err(RequestError::Generic(
+                StatusCode::BadRequest,
+                "Drive size refresh does not accept a request body.".to_string(),
+            ));
+        }
+        Ok(ParsedRequest::new_sync(VmmAction::RefreshBlockDeviceSize(
+            id.to_string(),
+        )))
+    })();
+    result.inspect_err(|_| METRICS.patch_api_requests.drive_fails.inc())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

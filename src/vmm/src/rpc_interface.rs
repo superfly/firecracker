@@ -140,6 +140,8 @@ pub enum VmmAction {
     StopFreePageHinting,
     /// Update existing block device properties such as `path_on_host` or `rate_limiter`.
     UpdateBlockDevice(BlockDeviceUpdateConfig),
+    /// Refresh the capacity of an existing virtio block device after microVM start.
+    RefreshBlockDeviceSize(String),
     /// Update a network interface, after microVM start. Currently, the only updatable properties
     /// are the RX and TX rate limiters.
     UpdateNetworkInterface(NetworkInterfaceUpdateConfig),
@@ -491,6 +493,7 @@ impl<'a> PrebootApiController<'a> {
             | UpdateBalloon(_)
             | UpdateBalloonStatistics(_)
             | UpdateBlockDevice(_)
+            | RefreshBlockDeviceSize(_)
             | UpdateMemoryHotplugSize(_)
             | UpdateNetworkInterface(_)
             | StartFreePageHinting(_)
@@ -763,6 +766,14 @@ impl RuntimeApiController {
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::BalloonUpdate),
             UpdateBlockDevice(new_cfg) => self.update_block_device(new_cfg),
+            RefreshBlockDeviceSize(drive_id) => {
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .refresh_block_device_size(&drive_id)
+                    .map_err(DriveError::DeviceUpdate)?;
+                Ok(VmmData::Empty)
+            }
             UpdateNetworkInterface(netif_update) => self.update_net_rate_limiters(netif_update),
             UpdateMemoryHotplugSize(cfg) => self
                 .vmm
@@ -1231,6 +1242,9 @@ mod tests {
         )));
         check_unsupported(preboot_request(VmmAction::UpdateBlockDevice(
             BlockDeviceUpdateConfig::default(),
+        )));
+        check_unsupported(preboot_request(VmmAction::RefreshBlockDeviceSize(
+            "scratch".to_string(),
         )));
         check_unsupported(preboot_request(VmmAction::UpdateNetworkInterface(
             NetworkInterfaceUpdateConfig {

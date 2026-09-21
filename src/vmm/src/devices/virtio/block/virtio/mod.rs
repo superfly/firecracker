@@ -57,8 +57,8 @@ pub enum VirtioBlockError {
     BackingFile(std::io::Error, String),
     /// Error opening eventfd: {0}
     EventFd(std::io::Error),
-    /// Error creating an interrupt: {0}
-    Interrupt(std::io::Error),
+    /// Error triggering an interrupt: {0}
+    Interrupt(crate::vstate::interrupts::InterruptError),
     /// Error coming from the rate limiter: {0}
     RateLimiter(std::io::Error),
     /// Persistence error: {0}

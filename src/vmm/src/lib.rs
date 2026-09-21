@@ -533,6 +533,13 @@ impl Vmm {
         Ok(())
     }
 
+    /// Refreshes block device capacity using its existing backing file descriptor.
+    pub fn refresh_block_device_size(&mut self, drive_id: &str) -> Result<(), VmmError> {
+        self.device_manager
+            .with_virtio_device(drive_id, |block: &mut Block| block.refresh_size())??;
+        Ok(())
+    }
+
     /// Updates the rate limiter parameters for block device with `drive_id` id.
     pub fn update_block_rate_limiter(
         &mut self,
