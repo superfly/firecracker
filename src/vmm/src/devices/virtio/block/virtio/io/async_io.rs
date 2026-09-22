@@ -17,6 +17,8 @@ use crate::io_uring::{IoUring, IoUringError};
 use crate::logger::log_dev_preview_warning;
 use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
 
+const MAX_OUTSTANDING_OPS: u32 = 16;
+
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum AsyncIoError {
     /// IO: {0}
@@ -107,6 +109,11 @@ impl AsyncFileEngine {
 
     pub fn completion_evt(&self) -> &EventFd {
         &self.completion_evt
+    }
+
+    pub fn is_throttled(&self) -> bool {
+        // Include queued operations and completions not yet consumed by the device.
+        self.ring.num_ops() >= MAX_OUTSTANDING_OPS
     }
 
     pub fn push_read(

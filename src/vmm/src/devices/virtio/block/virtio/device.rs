@@ -405,6 +405,13 @@ impl VirtioBlock {
         let mut used_any = false;
 
         while let Some(head) = queue.pop_or_enable_notification()? {
+            if let FileEngine::Async(engine) = &self.disk.file_engine
+                && engine.is_throttled()
+            {
+                queue.undo_pop();
+                self.is_io_engine_throttled = true;
+                break;
+            }
             self.metrics.remaining_reqs_count.add(queue.len().into());
             let processing_result =
                 match Request::parse(&head, &active_state.mem, self.disk.nsectors) {
@@ -724,7 +731,6 @@ mod tests {
 
     use super::*;
     use crate::check_metric_after_block;
-    use crate::devices::virtio::block::virtio::IO_URING_NUM_ENTRIES;
     use crate::devices::virtio::block::virtio::test_utils::{
         default_block, default_block_with_path, read_blk_req_descriptors, set_queue,
         set_rate_limiter, simulate_async_completion_event,
@@ -1618,68 +1624,25 @@ mod tests {
 
     #[test]
     fn test_io_engine_throttling() {
-        // FullSQueue BlockError
-        {
+        for count in [16, 17, 47] {
             let mut block = default_block(FileEngineType::Async);
-
             let mem = default_mem();
             let interrupt = default_interrupt();
-            let vq = VirtQueue::new(GuestAddress(0), &mem, IO_URING_NUM_ENTRIES * 4);
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 128);
             block.queues[0] = vq.create_queue();
             block.activate(mem.clone(), interrupt).unwrap();
 
-            // Run scenario that doesn't trigger FullSq BlockError: Add sq_size flush requests.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
+            add_flush_requests_batch(&mut block, &vq, count);
             simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
+            assert_eq!(vq.used.idx.get(), 0);
+
+            // Completion handling admits the next batch without another guest queue kick.
+            for completed in (16..count).step_by(16) {
+                simulate_async_completion_event(&mut block, true);
+                check_flush_requests_batch(completed, &vq);
+            }
             simulate_async_completion_event(&mut block, true);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
-
-            // Run scenario that triggers FullSqError : Add sq_size + 10 flush requests.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES + 10);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(block.is_io_engine_throttled);
-            // When the async_completion_event is triggered:
-            // 1. sq_size requests should be processed processed.
-            // 2. is_io_engine_throttled should be set back to false.
-            // 3. process_queue() should be called again.
-            simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
-            // check that process_queue() was called again resulting in the processing of the
-            // remaining 10 ops.
-            simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES + 10, &vq);
-        }
-
-        // FullCQueue BlockError
-        {
-            let mut block = default_block(FileEngineType::Async);
-
-            let mem = default_mem();
-            let interrupt = default_interrupt();
-            let vq = VirtQueue::new(GuestAddress(0), &mem, IO_URING_NUM_ENTRIES * 4);
-            block.queues[0] = vq.create_queue();
-            block.activate(mem.clone(), interrupt).unwrap();
-
-            // Run scenario that triggers FullCqError. Push 2 * IO_URING_NUM_ENTRIES and wait for
-            // completion. Then try to push another entry.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
-            thread::sleep(Duration::from_millis(150));
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
-            thread::sleep(Duration::from_millis(150));
-
-            add_flush_requests_batch(&mut block, &vq, 1);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(block.is_io_engine_throttled);
-            simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES * 2, &vq);
+            check_flush_requests_batch(count, &vq);
         }
     }
 
