@@ -29,6 +29,12 @@ drives, use the existing `PATCH /drives/{drive_id}` operation described below.
 
 ## Updating Virtio block devices after boot
 
+Replacing `path_on_host` is supported only for `Sync` drives. For `Async`
+drives, `PATCH /drives/{drive_id}` requests containing `path_on_host` return
+`400`, including requests that repeat the existing path. Use
+`PATCH /drives/{drive_id}/refresh-size` after growing the existing backing
+device. Rate-limiter updates remain supported for both engines.
+
 Firecracker offers support to update attached block devices after the microVM
 has been started. This is provided via PATCH /drives API which notifies
 Firecracker that the underlying block file has been changed on the host. It

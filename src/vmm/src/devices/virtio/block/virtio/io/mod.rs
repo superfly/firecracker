@@ -66,15 +66,6 @@ impl FileEngine {
         }
     }
 
-    pub fn update_file_path(&mut self, file: File) -> Result<(), BlockIoError> {
-        match self {
-            FileEngine::Async(engine) => engine.update_file(file).map_err(BlockIoError::Async)?,
-            FileEngine::Sync(engine) => engine.update_file(file),
-        };
-
-        Ok(())
-    }
-
     pub fn file(&self) -> &File {
         match self {
             FileEngine::Async(engine) => engine.file(),

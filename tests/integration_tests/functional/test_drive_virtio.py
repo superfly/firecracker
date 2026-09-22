@@ -57,27 +57,31 @@ def test_rescan_file(uvm_plain_any, io_engine):
     assert "dd: error reading '/dev/vdb': Input/output error" in stderr
     _check_file_size(test_microvm.ssh, f"{block_copy_name}", truncated_size * MB)
 
-    test_microvm.api.drive.patch(
-        drive_id="scratch",
-        path_on_host=test_microvm.create_jailed_resource(fs.path),
+    response = test_microvm.api.session.patch(
+        test_microvm.api.endpoint + "/drives/scratch/refresh-size"
     )
+    assert response.status_code == 204, response.text
 
     _check_block_size(test_microvm.ssh, "/dev/vdb", fs.size())
 
 
-def test_refresh_size(uvm_plain_any, io_engine):
+@pytest.mark.parametrize("restore", [False, True])
+def test_refresh_size(uvm_plain_any, microvm_factory, io_engine, restore):
     """Refresh capacity in place and use the added space with either IO engine."""
     vm = uvm_plain_any
     vm.spawn()
     vm.basic_config()
     vm.add_net_iface()
     fs = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "scratch"), size=2)
-    vm.add_drive("scratch", fs.path, io_engine=io_engine)
+    vm.add_drive("scratch", fs.path, io_engine=io_engine, cache_type="Writeback")
     endpoint = vm.api.endpoint + "/drives/scratch/refresh-size"
 
     # Capacity refresh is only available after boot.
     assert vm.api.session.patch(endpoint).status_code == 400
     vm.start()
+    if restore:
+        vm = microvm_factory.build_from_snapshot(vm.snapshot_full())
+        endpoint = vm.api.endpoint + "/drives/scratch/refresh-size"
     assert (
         vm.api.session.patch(
             vm.api.endpoint + "/drives/missing/refresh-size"
@@ -88,7 +92,7 @@ def test_refresh_size(uvm_plain_any, io_engine):
 
     vm.ssh.check_output("dd if=/dev/urandom of=/tmp/refresh-data bs=1M count=1")
     for size in [3, 4, 4]:
-        os.truncate(fs.path, size * MB)
+        os.truncate(vm.disks["scratch"], size * MB)
         response = vm.api.session.patch(endpoint)
         assert response.status_code == 204, response.text
         for attempt in Retrying(
@@ -100,7 +104,7 @@ def test_refresh_size(uvm_plain_any, io_engine):
         # Exercise IO beyond the original capacity, bypassing the guest page cache.
         vm.ssh.check_output(
             f"dd if=/tmp/refresh-data of=/dev/vdb bs=1M seek={size - 1} "
-            "count=1 oflag=direct"
+            "count=1 oflag=direct conv=fsync"
         )
         vm.ssh.check_output(
             f"dd if=/dev/vdb of=/tmp/refresh-read bs=1M skip={size - 1} "
@@ -167,30 +171,31 @@ def test_rescan_dev(uvm_plain_any, io_engine):
     test_microvm.basic_config()
     test_microvm.add_net_iface()
 
-    # Add a scratch block device.
-    fs1 = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "fs1"))
-    test_microvm.add_drive("scratch", fs1.path, io_engine=io_engine)
-
-    test_microvm.start()
-
-    _check_block_size(test_microvm.ssh, "/dev/vdb", fs1.size())
-
-    fs2 = drive_tools.FilesystemFile(
-        os.path.join(test_microvm.fsfiles, "fs2"), size=512
+    fs = drive_tools.FilesystemFile(
+        os.path.join(test_microvm.fsfiles, "scratch"), size=2
     )
 
-    losetup = ["losetup", "--find", "--show", fs2.path]
+    losetup = ["losetup", "--find", "--show", fs.path]
     rc, stdout, _ = utils.check_output(losetup)
     assert rc == 0
     loopback_device = stdout.rstrip()
 
     try:
-        test_microvm.api.drive.patch(
-            drive_id="scratch",
-            path_on_host=test_microvm.create_jailed_resource(loopback_device),
-        )
+        test_microvm.add_drive("scratch", loopback_device, io_engine=io_engine)
+        test_microvm.start()
+        _check_block_size(test_microvm.ssh, "/dev/vdb", 2 * MB)
 
-        _check_block_size(test_microvm.ssh, "/dev/vdb", fs2.size())
+        os.truncate(fs.path, 4 * MB)
+        utils.check_output(["losetup", "--set-capacity", loopback_device])
+        response = test_microvm.api.session.patch(
+            test_microvm.api.endpoint + "/drives/scratch/refresh-size"
+        )
+        assert response.status_code == 204, response.text
+        for attempt in Retrying(
+            stop=stop_after_attempt(20), wait=wait_fixed(0.1), reraise=True
+        ):
+            with attempt:
+                _check_block_size(test_microvm.ssh, "/dev/vdb", 4 * MB)
     finally:
         if loopback_device:
             utils.check_output(["losetup", "--detach", loopback_device])
@@ -318,6 +323,25 @@ def test_patch_drive(uvm_plain_any, io_engine):
     fs2 = drive_tools.FilesystemFile(
         os.path.join(test_microvm.fsfiles, "otherscratch"), size=512
     )
+    if io_engine == "Async":
+        for path in [fs1.path, fs2.path]:
+            response = test_microvm.api.session.patch(
+                test_microvm.api.endpoint + "/drives/scratch",
+                json={
+                    "drive_id": "scratch",
+                    "path_on_host": test_microvm.create_jailed_resource(path),
+                },
+            )
+            assert response.status_code == 400, response.text
+            assert "refresh-size" in response.json()["fault_message"]
+        # The original drive remains usable, and rate-limiter updates still work.
+        _check_block_size(test_microvm.ssh, "/dev/vdb", fs1.size())
+        _check_mount(test_microvm.ssh, "/dev/vdb")
+        test_microvm.api.drive.patch(
+            drive_id="scratch",
+            rate_limiter={"bandwidth": {"size": 0, "refill_time": 0}},
+        )
+        return
     test_microvm.api.drive.patch(
         drive_id="scratch", path_on_host=test_microvm.create_jailed_resource(fs2.path)
     )

@@ -47,19 +47,11 @@
             },
             {
                 "syscall": "eventfd2",
-                "comment": "Used for creating io_uring completion event, on drive patch"
+                "comment": "Used for device event notifications"
             },
             {
                 "syscall": "io_uring_enter",
                 "comment": "Used for submitting io_uring requests"
-            },
-            {
-                "syscall": "io_uring_setup",
-                "comment": "Used on drive patch"
-            },
-            {
-                "syscall": "io_uring_register",
-                "comment": "Used on drive patch"
             },
             {
                 "syscall": "brk",

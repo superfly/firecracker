@@ -313,6 +313,9 @@ paths:
       summary: Updates the properties of a drive. Post-boot only.
       description:
         Updates the properties of the drive with the ID specified by drive_id path parameter.
+        Updating path_on_host is supported only for Sync drives. Async drives reject
+        path_on_host updates, including the current path; use the refresh-size endpoint
+        to refresh their capacity. Rate-limiter updates are supported for both engines.
         Will fail if update is not possible.
       operationId: patchGuestDriveByID
       parameters:

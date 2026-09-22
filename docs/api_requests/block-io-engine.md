@@ -46,6 +46,20 @@ curl --unix-socket ${socket} -i \
          }"
 ```
 
+## Runtime restrictions
+
+Async disk rings are created and registered during device configuration or
+snapshot restoration, before the VMM installs its runtime seccomp filter.
+The default filters deny `io_uring_setup` and `io_uring_register` after that
+point. The VMM retains `io_uring_enter` to submit and complete disk requests.
+
+An Async drive's backing file cannot be replaced through
+`PATCH /drives/{drive_id}`. Such requests return `400` without changing the
+drive, even if the same pathname is supplied or seccomp is disabled. To expose
+host-side capacity changes, use `PATCH /drives/{drive_id}/refresh-size` with no
+body. This preserves the ring and its registered file. Rate-limiter updates and
+Sync drive replacement remain supported.
+
 ## Host requirements
 
 Firecracker requires a minimum host kernel version of 5.10.51 for the `Async` IO

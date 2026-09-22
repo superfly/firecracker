@@ -33,6 +33,8 @@ pub const IO_URING_NUM_ENTRIES: u16 = 128;
 /// Errors the block device can trigger.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VirtioBlockError {
+    /// Async backing file replacement is unsupported; use the drive's refresh-size endpoint.
+    AsyncBackingFileUpdate,
     /// Cannot create config
     Config,
     /// Guest gave us too few descriptors in a descriptor chain.

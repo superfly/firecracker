@@ -115,13 +115,16 @@ impl DiskProperties {
         disk_image_path: String,
         is_disk_read_only: bool,
     ) -> Result<(), VirtioBlockError> {
+        // Async rings and their registered backing files are fixed before the VMM's
+        // runtime seccomp filter is installed. Reject replacement before opening a file.
+        let FileEngine::Sync(engine) = &mut self.file_engine else {
+            return Err(VirtioBlockError::AsyncBackingFileUpdate);
+        };
         let disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
         let disk_size = Self::file_size(&disk_image_path, &disk_image)?;
 
         self.image_id = Self::build_disk_image_id(&disk_image);
-        self.file_engine
-            .update_file_path(disk_image)
-            .map_err(VirtioBlockError::FileEngine)?;
+        engine.update_file(disk_image);
         self.nsectors = disk_size >> SECTOR_SHIFT;
         self.file_path = disk_image_path;
 
@@ -712,7 +715,6 @@ impl Drop for VirtioBlock {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::metadata;
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::thread;
@@ -1928,6 +1930,14 @@ mod tests {
 
         // Submit a guest write, then refresh before delivering its completion.
         simulate_queue_event(&mut block, None);
+        // A rejected replacement must preserve the pending write and original device.
+        assert!(
+            block
+                .update_disk_image("/not/a/drive".to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("refresh-size")
+        );
         file.as_file().set_len(8192).unwrap();
         block.refresh_size().unwrap();
         assert!(interrupt.has_pending_interrupt(VirtioInterruptType::Config));
@@ -1982,32 +1992,22 @@ mod tests {
 
     #[test]
     fn test_update_disk_image() {
-        for engine in [FileEngineType::Sync, FileEngineType::Async] {
-            let mut block = default_block(engine);
-            let mem = default_mem();
-            let interrupt = default_interrupt();
-            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
-            set_queue(&mut block, 0, vq.create_queue());
-            block.activate(mem, interrupt).unwrap();
-            let f = TempFile::new().unwrap();
-            let path = f.as_path();
-            let mdata = metadata(path).unwrap();
-            let mut id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
-            let str_id = format!("{}{}{}", mdata.st_dev(), mdata.st_rdev(), mdata.st_ino());
-            let part_id = str_id.as_bytes();
-            id[..cmp::min(part_id.len(), VIRTIO_BLK_ID_BYTES as usize)].clone_from_slice(
-                &part_id[..cmp::min(part_id.len(), VIRTIO_BLK_ID_BYTES as usize)],
-            );
+        let mut block = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let interrupt = default_interrupt();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem, interrupt.clone()).unwrap();
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len(8192).unwrap();
 
-            block
-                .update_disk_image(String::from(path.to_str().unwrap()))
-                .unwrap();
+        block
+            .update_disk_image(file.as_path().to_str().unwrap().to_string())
+            .unwrap();
 
-            assert_eq!(
-                block.disk.file_engine.file().metadata().unwrap().st_ino(),
-                mdata.st_ino()
-            );
-            assert_eq!(block.disk.image_id, id.as_slice());
-        }
+        let mut capacity = [0; 8];
+        block.read_config(0, &mut capacity);
+        assert_eq!(u64::from_le_bytes(capacity), 16);
+        assert!(interrupt.has_pending_interrupt(VirtioInterruptType::Config));
     }
 }
