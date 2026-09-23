@@ -84,8 +84,6 @@ impl Persist<'_> for RateLimiter {
             },
             timer_fd: TimerFd::new_custom(ClockId::Monotonic, true, true)?,
             timer_active: false,
-            timer_deadline: None,
-            blocked_on: None,
             // Device policy, not limiter state: the owning device sets it after restore.
             min_refill_delay: None,
         };

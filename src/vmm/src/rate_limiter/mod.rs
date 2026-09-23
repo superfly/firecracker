@@ -18,7 +18,8 @@ pub enum RateLimiterError {
 
 // Interval at which the refill timer will run when limiter is at capacity.
 const REFILL_TIMER_INTERVAL_MS: u64 = 100;
-const REFILL_TIMER_INTERVAL: Duration = Duration::from_millis(REFILL_TIMER_INTERVAL_MS);
+const TIMER_REFILL_STATE: TimerState =
+    TimerState::Oneshot(Duration::from_millis(REFILL_TIMER_INTERVAL_MS));
 
 const NANOSEC_IN_ONE_MILLISEC: u64 = 1_000_000;
 
@@ -253,12 +254,6 @@ impl TokenBucket {
         Duration::from_nanos(u64::try_from(needed_ns).unwrap_or(u64::MAX))
     }
 
-    /// Replenishes the bucket and returns whether `tokens` can now be consumed.
-    fn can_reduce(&mut self, tokens: u64) -> bool {
-        self.auto_replenish();
-        tokens <= self.budget.saturating_add(self.one_time_burst)
-    }
-
     /// Returns the capacity of the token bucket.
     pub fn capacity(&self) -> u64 {
         self.size
@@ -286,7 +281,7 @@ impl TokenBucket {
 }
 
 /// Enum that describes the type of token used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TokenType {
     /// Token type used for bandwidth limiting.
     Bytes,
@@ -327,11 +322,6 @@ pub struct RateLimiter {
     timer_fd: TimerFd,
     // Internal flag that quickly determines timer state.
     timer_active: bool,
-    // Expiry of the armed timer. It can outlive `timer_active` after `try_unblock()`.
-    timer_deadline: Option<Instant>,
-    // The failed request that blocked the limiter, retried by `try_unblock()`. Unset when the
-    // limiter is not blocked, or is blocked for over-consumption.
-    blocked_on: Option<(TokenType, u64)>,
     // When set, a depleted bucket arms the timer for the time its tokens take to refill,
     // bounded below by this value. When unset, the timer always waits the fixed interval.
     min_refill_delay: Option<Duration>,
@@ -405,8 +395,6 @@ impl RateLimiter {
             ops: ops_token_bucket,
             timer_fd,
             timer_active: false,
-            timer_deadline: None,
-            blocked_on: None,
             min_refill_delay: None,
         })
     }
@@ -424,13 +412,11 @@ impl RateLimiter {
         self.min_refill_delay
     }
 
-    // Arm the timer of the rate limiter to fire after `delay`.
-    fn activate_timer(&mut self, delay: Duration) {
+    // Arm the timer of the rate limiter with the provided `TimerState`.
+    fn activate_timer(&mut self, timer_state: TimerState) {
         // Register the timer; don't care about its previous state
-        self.timer_fd
-            .set_state(TimerState::Oneshot(delay), SetTimeFlags::Default);
+        self.timer_fd.set_state(timer_state, SetTimeFlags::Default);
         self.timer_active = true;
-        self.timer_deadline = Some(Instant::now() + delay);
     }
 
     /// Attempts to consume tokens and returns whether that is possible.
@@ -455,21 +441,17 @@ impl RateLimiter {
                 // register a timer to replenish the bucket and resume processing;
                 // make sure there is only one running timer for this limiter.
                 BucketReduction::Failure => {
-                    let delay = match self.min_refill_delay {
-                        Some(min_delay) => bucket
-                            .refill_delay(tokens)
-                            .max(min_delay)
-                            .min(REFILL_TIMER_INTERVAL),
-                        None => REFILL_TIMER_INTERVAL,
-                    };
-                    self.blocked_on = Some((token_type, tokens));
-                    // A timer left armed by `try_unblock()` is reused if it fires soon enough,
-                    // which avoids re-arming it each time the limiter blocks.
-                    match self.timer_deadline {
-                        Some(deadline) if deadline <= Instant::now() + delay => {
-                            self.timer_active = true
-                        }
-                        _ => self.activate_timer(delay),
+                    if !self.timer_active {
+                        let timer_state = match self.min_refill_delay {
+                            Some(min_delay) => TimerState::Oneshot(
+                                bucket
+                                    .refill_delay(tokens)
+                                    .max(min_delay)
+                                    .min(Duration::from_millis(REFILL_TIMER_INTERVAL_MS)),
+                            ),
+                            None => TIMER_REFILL_STATE,
+                        };
+                        self.activate_timer(timer_state);
                     }
                     false
                 }
@@ -486,9 +468,9 @@ impl RateLimiter {
                     // `ratio * refill_time` milliseconds.
                     // The conversion should be safe because the ratio is positive.
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    self.activate_timer(Duration::from_millis((ratio * refill_time as f64) as u64));
-                    // The borrowed tokens must be paid back, so the block lasts its full duration.
-                    self.blocked_on = None;
+                    self.activate_timer(TimerState::Oneshot(Duration::from_millis(
+                        (ratio * refill_time as f64) as u64,
+                    )));
                     true
                 }
             }
@@ -524,32 +506,6 @@ impl RateLimiter {
         self.timer_active
     }
 
-    /// Unblocks the limiter before its refill timer fires if the request that blocked it can now
-    /// be served. Returns whether the limiter is unblocked.
-    ///
-    /// Callers woken for other reasons, such as I/O completions, use this to resume sooner than
-    /// the timer. A block for over-consumption lasts its full duration. The timer stays armed
-    /// and its event, if it fires after an early unblock, only resumes processing.
-    pub fn try_unblock(&mut self) -> bool {
-        if !self.timer_active {
-            return true;
-        }
-        let Some((token_type, tokens)) = self.blocked_on else {
-            return false;
-        };
-        let token_bucket = match token_type {
-            TokenType::Bytes => self.bandwidth.as_mut(),
-            TokenType::Ops => self.ops.as_mut(),
-        };
-        // A bucket removed since the failure no longer limits the request.
-        if token_bucket.is_some_and(|bucket| !bucket.can_reduce(tokens)) {
-            return false;
-        }
-        self.timer_active = false;
-        self.blocked_on = None;
-        true
-    }
-
     /// This function needs to be called every time there is an event on the
     /// FD provided by this object's `AsRawFd` trait implementation.
     ///
@@ -563,8 +519,6 @@ impl RateLimiter {
             )),
             _ => {
                 self.timer_active = false;
-                self.timer_deadline = None;
-                self.blocked_on = None;
                 Ok(())
             }
         }
@@ -1182,69 +1136,6 @@ pub(crate) mod tests {
         let delay = armed_delay(&l);
         assert!(delay <= max_delay, "{delay:?}");
         assert!(delay > max_delay - Duration::from_millis(5), "{delay:?}");
-    }
-
-    #[test]
-    fn test_rate_limiter_try_unblock() {
-        // Bandwidth of 1 byte per millisecond.
-        let mut l = RateLimiter::new(1000, 0, 1000, 0, 0, 0).unwrap();
-        l.set_min_refill_delay(Duration::from_millis(5));
-        assert!(l.try_unblock());
-
-        assert!(l.consume(1000, TokenType::Bytes));
-        assert!(!l.consume(20, TokenType::Bytes));
-        assert_eq!(l.blocked_on, Some((TokenType::Bytes, 20)));
-        let deadline = l.timer_deadline.unwrap();
-
-        // The blocked request's tokens have not accrued yet.
-        assert!(!l.try_unblock());
-        assert!(l.is_blocked());
-
-        // Once they have, the limiter unblocks without its timer.
-        thread::sleep(Duration::from_millis(30));
-        assert!(l.try_unblock());
-        assert!(!l.is_blocked());
-        assert_eq!(l.blocked_on, None);
-        assert!(l.consume(20, TokenType::Bytes));
-
-        // Blocking again reuses the armed timer rather than re-arming it.
-        assert!(!l.consume(1000, TokenType::Bytes));
-        assert!(l.is_blocked());
-        assert_eq!(l.timer_deadline, Some(deadline));
-
-        // The leftover timer event unblocks the limiter as usual.
-        l.event_handler().unwrap();
-        assert!(!l.is_blocked());
-        assert_eq!(l.timer_deadline, None);
-        assert_eq!(l.blocked_on, None);
-
-        // An ops block is retried against the ops bucket.
-        let mut l = RateLimiter::new(0, 0, 0, 1000, 0, 1000).unwrap();
-        l.set_min_refill_delay(Duration::from_millis(5));
-        assert!(l.consume(1000, TokenType::Ops));
-        assert!(!l.consume(10, TokenType::Ops));
-        assert!(!l.try_unblock());
-        thread::sleep(Duration::from_millis(20));
-        assert!(l.try_unblock());
-        assert!(l.consume(10, TokenType::Ops));
-
-        // Borrowed tokens must be paid back: over-consumption blocks for its full duration.
-        let mut l = RateLimiter::new(100, 0, 100, 0, 0, 0).unwrap();
-        l.set_min_refill_delay(Duration::from_millis(5));
-        assert!(l.consume(250, TokenType::Bytes));
-        assert!(l.is_blocked());
-        assert_eq!(l.blocked_on, None);
-        thread::sleep(Duration::from_millis(20));
-        assert!(!l.try_unblock());
-        assert!(l.is_blocked());
-
-        // A bucket removed while blocked no longer holds the request back.
-        let mut l = RateLimiter::new(1000, 0, 1000, 0, 0, 0).unwrap();
-        assert!(l.consume(1000, TokenType::Bytes));
-        assert!(!l.consume(500, TokenType::Bytes));
-        l.update_buckets(BucketUpdate::Disabled, BucketUpdate::None);
-        assert!(l.try_unblock());
-        assert!(l.consume(500, TokenType::Bytes));
     }
 
     #[test]

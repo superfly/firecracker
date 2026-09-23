@@ -463,7 +463,7 @@ impl VirtioBlock {
         if let Err(err) = self.queue_evts[0].read() {
             error!("Failed to get queue event: {:?}", err);
             self.metrics.event_fails.inc();
-        } else if self.rate_limiter.is_blocked() && !self.rate_limiter.try_unblock() {
+        } else if self.rate_limiter.is_blocked() {
             self.metrics.rate_limiter_throttled_events.inc();
         } else if self.is_io_engine_throttled {
             self.metrics.io_engine_throttled_events.inc();
@@ -634,11 +634,7 @@ impl VirtioBlock {
         } else {
             self.process_async_completion_queue();
 
-            // Completions also clock the rate limiter: resume as soon as the blocked request's
-            // tokens have accrued, instead of when the refill timer fires.
-            let rate_limiter_unblocked =
-                self.rate_limiter.is_blocked() && self.rate_limiter.try_unblock();
-            if self.is_io_engine_throttled || rate_limiter_unblocked {
+            if self.is_io_engine_throttled {
                 self.is_io_engine_throttled = false;
                 self.process_queue(0).unwrap()
             }
@@ -1931,41 +1927,6 @@ mod tests {
                 assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
             }
         }
-    }
-
-    #[test]
-    fn test_rate_limiter_unblocked_by_completion() {
-        let mut block = default_block(FileEngineType::Async);
-        let mem = default_mem();
-        let interrupt = default_interrupt();
-        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
-        block.queues[0] = vq.create_queue();
-        block.activate(mem.clone(), interrupt).unwrap();
-
-        // One operation per 100ms. The refill timer waits the full 100ms.
-        let mut rl = RateLimiter::new(0, 0, 0, 1, 0, 100).unwrap();
-        rl.set_min_refill_delay(Duration::from_millis(100));
-        set_rate_limiter(&mut block, rl);
-
-        // The first flush uses the only token and the second blocks the limiter.
-        add_flush_requests_batch(&mut block, &vq, 2);
-        simulate_queue_event(&mut block, Some(false));
-        assert!(block.rate_limiter.is_blocked());
-
-        // The first flush completes once the token has refilled, and its completion submits
-        // the second flush without the refill timer's event being handled.
-        simulate_async_completion_event(&mut block, true);
-        assert!(!block.rate_limiter.is_blocked());
-        simulate_async_completion_event(&mut block, true);
-        check_flush_requests_batch(2, &vq);
-
-        // The leftover timer event is still pending, and only resumes processing.
-        check_metric_after_block!(
-            &block.metrics.rate_limiter_event_count,
-            1,
-            block.process_rate_limiter_event()
-        );
-        check_flush_requests_batch(2, &vq);
     }
 
     #[test]
