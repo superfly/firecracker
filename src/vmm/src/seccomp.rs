@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bincode::config;
 use bincode::config::{Configuration, Fixint, Limit, LittleEndian};
@@ -43,7 +43,25 @@ pub fn get_empty_filters() -> BpfThreadMap {
     map.insert("vmm".to_string(), Arc::new(vec![]));
     map.insert("api".to_string(), Arc::new(vec![]));
     map.insert("vcpu".to_string(), Arc::new(vec![]));
+    map.insert("block_io".to_string(), Arc::new(vec![]));
     map
+}
+
+/// Filter applied by block device IO worker threads, see [`set_block_io_filter`].
+static BLOCK_IO_FILTER: OnceLock<Arc<BpfProgram>> = OnceLock::new();
+
+/// Set the filter each block device IO worker thread applies to itself when it starts.
+///
+/// Those threads are started whenever a drive is created, which is before the VMM thread's own
+/// filter is installed, so they cannot rely on inheriting it. Only the first call has an effect.
+pub fn set_block_io_filter(filter: Arc<BpfProgram>) {
+    // Ignoring the error is what makes later calls no-ops.
+    let _ = BLOCK_IO_FILTER.set(filter);
+}
+
+/// The filter set with [`set_block_io_filter`], if any.
+pub fn block_io_filter() -> Option<BpfProgramRef<'static>> {
+    BLOCK_IO_FILTER.get().map(|filter| filter.as_slice())
 }
 
 /// Deserialize binary with bpf filters

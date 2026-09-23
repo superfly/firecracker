@@ -363,6 +363,14 @@ fn main_exec() -> Result<(), MainError> {
     .and_then(seccomp::get_filters)
     .map_err(MainError::SeccompFilter)?;
 
+    // Block device IO worker threads install their own filter; see `vmm::seccomp`.
+    if let Some(filter) = seccomp_filters
+        .get("block_io")
+        .or_else(|| seccomp_filters.get("vmm"))
+    {
+        vmm::seccomp::set_block_io_filter(filter.clone());
+    }
+
     let vmm_config_json = arguments
         .single_value("config-file")
         .map(fs::read_to_string)

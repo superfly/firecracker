@@ -397,9 +397,6 @@ impl Request {
 
         match res {
             Ok(block_io::FileEngineOk::Submitted) => ProcessingResult::Submitted,
-            Ok(block_io::FileEngineOk::Executed(res)) => {
-                ProcessingResult::Executed(res.req.finish(mem, Ok(res.count), block_metrics))
-            }
             Err(err) => {
                 if err.error.is_throttling_err() {
                     ProcessingResult::Throttled

@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::io::async_io;
 use super::request::*;
 use super::{BLOCK_QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError, io as block_io};
 use crate::devices::virtio::ActivateError;
@@ -268,18 +267,6 @@ pub struct VirtioBlock {
     pub metrics: Arc<BlockDeviceMetrics>,
 }
 
-macro_rules! unwrap_async_file_engine_or_return {
-    ($file_engine: expr) => {
-        match $file_engine {
-            FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
-                error!("The block device doesn't use an async IO engine");
-                return;
-            }
-        }
-    };
-}
-
 impl VirtioBlock {
     /// Create a new virtio block device that operates on the given file.
     ///
@@ -468,34 +455,22 @@ impl VirtioBlock {
         Ok(())
     }
 
+    /// Hand the requests the IO engine finished back to the guest.
     fn process_async_completion_queue(&mut self) {
-        let engine = unwrap_async_file_engine_or_return!(&mut self.disk.file_engine);
-
         // This is safe since we checked in the event handler that the device is activated.
         let active_state = self.device_state.active_state().unwrap();
         let queue = &mut self.queues[0];
 
         loop {
-            match engine.pop(&active_state.mem) {
+            match self.disk.file_engine.pop(&active_state.mem) {
                 Err(error) => {
-                    error!("Failed to read completed io_uring entry: {:?}", error);
+                    error!("Failed to read completed block request: {:?}", error);
                     break;
                 }
                 Ok(None) => break,
-                Ok(Some(cqe)) => {
-                    let res = cqe.result();
-                    let user_data = cqe.user_data();
-
-                    let (pending, res) = match res {
-                        Ok(count) => (user_data, Ok(count)),
-                        Err(error) => (
-                            user_data,
-                            Err(IoErr::FileEngine(block_io::BlockIoError::Async(
-                                async_io::AsyncIoError::IO(error),
-                            ))),
-                        ),
-                    };
-                    let finished = pending.finish(&active_state.mem, res, &self.metrics);
+                Ok(Some(completion)) => {
+                    let res = completion.result.map_err(IoErr::FileEngine);
+                    let finished = completion.req.finish(&active_state.mem, res, &self.metrics);
                     queue
                         .add_used(finished.desc_idx, finished.num_bytes_to_mem)
                         .unwrap_or_else(|err| {
@@ -520,9 +495,7 @@ impl VirtioBlock {
     }
 
     pub fn process_async_completion_event(&mut self) {
-        let engine = unwrap_async_file_engine_or_return!(&mut self.disk.file_engine);
-
-        if let Err(err) = engine.completion_evt().read() {
+        if let Err(err) = self.disk.file_engine.completion_evt().read() {
             error!("Failed to get async completion event: {:?}", err);
         } else {
             self.process_async_completion_queue();
@@ -576,9 +549,7 @@ impl VirtioBlock {
         }
 
         self.drain_and_flush(false);
-        if let FileEngine::Async(ref _engine) = self.disk.file_engine {
-            self.process_async_completion_queue();
-        }
+        self.process_async_completion_queue();
     }
 }
 
@@ -701,6 +672,7 @@ mod tests {
     use super::*;
     use crate::check_metric_after_block;
     use crate::devices::virtio::block::virtio::IO_URING_NUM_ENTRIES;
+    use crate::devices::virtio::block::virtio::io::sync_io::SYNC_IO_MAX_IN_FLIGHT;
     use crate::devices::virtio::block::virtio::test_utils::{
         default_block, read_blk_req_descriptors, set_queue, set_rate_limiter,
         simulate_async_completion_event, simulate_queue_and_async_completion_events,
@@ -1594,25 +1566,29 @@ mod tests {
 
     #[test]
     fn test_io_engine_throttling() {
-        // FullSQueue BlockError
-        {
-            let mut block = default_block(FileEngineType::Async);
+        // FullSQueue BlockError, or the sync engine's in-flight limit.
+        let sync_limit = u16::try_from(SYNC_IO_MAX_IN_FLIGHT).unwrap();
+        for (engine, limit) in [
+            (FileEngineType::Sync, sync_limit),
+            (FileEngineType::Async, IO_URING_NUM_ENTRIES),
+        ] {
+            let mut block = default_block(engine);
 
             let mem = default_mem();
             let interrupt = default_interrupt();
-            let vq = VirtQueue::new(GuestAddress(0), &mem, IO_URING_NUM_ENTRIES * 4);
+            let vq = VirtQueue::new(GuestAddress(0), &mem, limit * 4);
             block.queues[0] = vq.create_queue();
             block.activate(mem.clone(), interrupt).unwrap();
 
             // Run scenario that doesn't trigger FullSq BlockError: Add sq_size flush requests.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
+            add_flush_requests_batch(&mut block, &vq, limit);
             simulate_queue_event(&mut block, Some(false));
             assert!(!block.is_io_engine_throttled);
             simulate_async_completion_event(&mut block, true);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
+            check_flush_requests_batch(limit, &vq);
 
             // Run scenario that triggers FullSqError : Add sq_size + 10 flush requests.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES + 10);
+            add_flush_requests_batch(&mut block, &vq, limit + 10);
             simulate_queue_event(&mut block, Some(false));
             assert!(block.is_io_engine_throttled);
             // When the async_completion_event is triggered:
@@ -1621,12 +1597,12 @@ mod tests {
             // 3. process_queue() should be called again.
             simulate_async_completion_event(&mut block, true);
             assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
+            check_flush_requests_batch(limit, &vq);
             // check that process_queue() was called again resulting in the processing of the
             // remaining 10 ops.
             simulate_async_completion_event(&mut block, true);
             assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES + 10, &vq);
+            check_flush_requests_batch(limit + 10, &vq);
         }
 
         // FullCQueue BlockError

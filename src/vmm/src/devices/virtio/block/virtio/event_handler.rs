@@ -3,7 +3,6 @@
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
-use super::io::FileEngine;
 use crate::devices::virtio::block::virtio::device::VirtioBlock;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::logger::{error, warn};
@@ -29,13 +28,11 @@ impl VirtioBlock {
         )) {
             error!("Failed to register ratelimiter event: {}", err);
         }
-        if let FileEngine::Async(ref engine) = self.disk.file_engine
-            && let Err(err) = ops.add(Events::with_data(
-                engine.completion_evt(),
-                Self::PROCESS_ASYNC_COMPLETION,
-                EventSet::IN,
-            ))
-        {
+        if let Err(err) = ops.add(Events::with_data(
+            self.disk.file_engine.completion_evt(),
+            Self::PROCESS_ASYNC_COMPLETION,
+            EventSet::IN,
+        )) {
             error!("Failed to register IO engine completion event: {}", err);
         }
     }

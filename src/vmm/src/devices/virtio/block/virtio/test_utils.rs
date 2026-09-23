@@ -95,14 +95,14 @@ pub fn simulate_queue_event(b: &mut VirtioBlock, maybe_expected_irq: Option<bool
 
 #[cfg(test)]
 pub fn simulate_async_completion_event(b: &mut VirtioBlock, expected_irq: bool) {
-    if let FileEngine::Async(ref mut engine) = b.disk.file_engine {
-        // Wait for all the async operations to complete.
-        engine.drain(false).unwrap();
+    // Wait for all the submitted operations to complete.
+    b.disk.file_engine.drain(false).unwrap();
+    if let FileEngine::Async(_) = b.disk.file_engine {
         // Wait for the async completion event to be sent.
         thread::sleep(Duration::from_millis(150));
-        // Handle event.
-        b.process_async_completion_event();
     }
+    // Handle event.
+    b.process_async_completion_event();
 
     // Validate if there are pending IRQs.
     assert_eq!(
@@ -114,15 +114,8 @@ pub fn simulate_async_completion_event(b: &mut VirtioBlock, expected_irq: bool) 
 
 #[cfg(test)]
 pub fn simulate_queue_and_async_completion_events(b: &mut VirtioBlock, expected_irq: bool) {
-    match b.disk.file_engine {
-        FileEngine::Async(_) => {
-            simulate_queue_event(b, None);
-            simulate_async_completion_event(b, expected_irq);
-        }
-        FileEngine::Sync(_) => {
-            simulate_queue_event(b, Some(expected_irq));
-        }
-    }
+    simulate_queue_event(b, None);
+    simulate_async_completion_event(b, expected_irq);
 }
 
 /// Structure encapsulating the virtq descriptors of a single request to the block device
