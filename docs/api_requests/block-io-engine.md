@@ -60,6 +60,43 @@ host-side capacity changes, use `PATCH /drives/{drive_id}/refresh-size` with no
 body. This preserves the ring and its registered file. Rate-limiter updates and
 Sync drive replacement remain supported.
 
+## Direct I/O
+
+Setting `"direct": true` on a virtio-block drive opens its backing file with
+`O_DIRECT`, so guest I/O bypasses the host page cache with either engine. A
+flush then only has to flush the device, rather than write back dirty host
+pages first.
+
+`O_DIRECT` requires block-aligned file offsets, lengths and buffers, so the
+drive advertises its block size to the guest with `VIRTIO_BLK_F_BLK_SIZE`. For
+block devices this is the logical block size (`BLKSSZGET`); regular files use
+4096 bytes. The guest then issues whole-block requests. The guest-visible block
+size must suit the filesystem on the drive: a filesystem with blocks smaller
+than the advertised size cannot be mounted.
+
+- Capacity is rounded down to whole blocks, including after
+  `PATCH /drives/{drive_id}/refresh-size`.
+- Requests with unaligned offsets or lengths fail with `VIRTIO_BLK_S_IOERR`.
+- Requests whose guest buffer is not aligned are copied through an aligned
+  host buffer, up to 1 MiB per request. Larger unaligned requests fail.
+- The backing file cannot be replaced through `PATCH /drives/{drive_id}`.
+- Snapshots restore the drive with `O_DIRECT` and re-read the block size.
+
+```bash
+curl --unix-socket ${socket} -i \
+     -X PUT "http://localhost/drives/data" \
+     -H "Content-Type: application/json" \
+     -d "{
+             \"drive_id\": \"data\",
+             \"path_on_host\": \"${drive_path}\",
+             \"is_root_device\": false,
+             \"is_read_only\": false,
+             \"io_engine\": \"Async\",
+             \"cache_type\": \"Writeback\",
+             \"direct\": true
+         }"
+```
+
 ## Host requirements
 
 Firecracker requires a minimum host kernel version of 5.10.51 for the `Async` IO

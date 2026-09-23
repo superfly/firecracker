@@ -74,6 +74,7 @@ impl TryFrom<&BlockDeviceConfig> for VhostUserBlockConfig {
             && value.path_on_host.is_none()
             && value.rate_limiter.is_none()
             && value.file_engine_type.is_none()
+            && value.direct.is_none()
         {
             Ok(Self {
                 drive_id: value.drive_id.clone(),
@@ -101,6 +102,7 @@ impl From<VhostUserBlockConfig> for BlockDeviceConfig {
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: Some(value.socket),
         }
@@ -405,10 +407,18 @@ mod tests {
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: Some("sock".to_string()),
         };
         VhostUserBlockConfig::try_from(&block_config).unwrap();
+
+        // Direct I/O is a virtio-block option.
+        let block_config = BlockDeviceConfig {
+            direct: Some(true),
+            ..block_config
+        };
+        VhostUserBlockConfig::try_from(&block_config).unwrap_err();
 
         let block_config = BlockDeviceConfig {
             drive_id: "".to_string(),
@@ -420,6 +430,7 @@ mod tests {
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
+            direct: None,
 
             socket: None,
         };
@@ -435,6 +446,7 @@ mod tests {
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
+            direct: None,
 
             socket: Some("sock".to_string()),
         };

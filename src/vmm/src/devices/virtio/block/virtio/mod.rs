@@ -38,6 +38,10 @@ pub const RATE_LIMITER_MIN_REFILL_DELAY: std::time::Duration = std::time::Durati
 pub enum VirtioBlockError {
     /// Async backing file replacement is unsupported; use the drive's refresh-size endpoint.
     AsyncBackingFileUpdate,
+    /// Direct I/O backing file replacement is unsupported; use the drive's refresh-size endpoint.
+    DirectBackingFileUpdate,
+    /// Unsupported logical block size for direct I/O: {0}
+    DirectIoBlockSize(i32),
     /// Cannot create config
     Config,
     /// Guest gave us too few descriptors in a descriptor chain.

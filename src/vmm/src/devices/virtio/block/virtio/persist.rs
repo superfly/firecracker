@@ -13,7 +13,7 @@ use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::virtio::metrics::BlockMetricsPerDevice;
 use crate::devices::virtio::device::{ActiveState, DeviceState};
-use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_RO;
+use crate::devices::virtio::generated::virtio_blk::{VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_RO};
 use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BLOCK;
 use crate::devices::virtio::persist::VirtioDeviceState;
 use crate::rate_limiter::RateLimiter;
@@ -87,6 +87,8 @@ impl Persist<'_> for VirtioBlock {
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
+        // Only direct I/O drives advertise a block size, so the snapshot format is unchanged.
+        let direct = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_BLK_SIZE) != 0;
         let mut rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
             .map_err(VirtioBlockError::RateLimiter)?;
         rate_limiter.set_min_refill_delay(RATE_LIMITER_MIN_REFILL_DELAY);
@@ -95,6 +97,7 @@ impl Persist<'_> for VirtioBlock {
             state.disk_path.clone(),
             is_read_only,
             state.file_engine_type.into(),
+            direct,
         )?;
 
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
@@ -112,9 +115,7 @@ impl Persist<'_> for VirtioBlock {
         let avail_features = state.virtio_state.avail_features;
         let acked_features = state.virtio_state.acked_features;
 
-        let config_space = ConfigSpace {
-            capacity: disk_properties.nsectors.to_le(),
-        };
+        let config_space = ConfigSpace::new(&disk_properties);
 
         Ok(VirtioBlock {
             avail_features,
@@ -165,6 +166,7 @@ mod tests {
             cache_type: CacheType::Writeback,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
+            direct: false,
         };
 
         let block = VirtioBlock::new(config).unwrap();
@@ -209,6 +211,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
+            direct: false,
         };
 
         let block = VirtioBlock::new(config).unwrap();
@@ -249,5 +252,53 @@ mod tests {
             restored_block.rate_limiter.min_refill_delay(),
             Some(RATE_LIMITER_MIN_REFILL_DELAY)
         );
+    }
+
+    #[test]
+    fn test_persistence_direct_io() {
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x2000).unwrap();
+
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let config = VirtioBlockConfig {
+                drive_id: "direct".to_string(),
+                path_on_host: f.as_path().to_str().unwrap().to_string(),
+                is_root_device: false,
+                partuuid: None,
+                is_read_only: false,
+                cache_type: CacheType::Writeback,
+                rate_limiter: None,
+                file_engine_type: engine,
+                direct: true,
+            };
+            let block = match VirtioBlock::new(config) {
+                Err(VirtioBlockError::BackingFile(err, _))
+                    if err.raw_os_error() == Some(libc::EINVAL) =>
+                {
+                    eprintln!("skipping: the test filesystem does not support O_DIRECT");
+                    return;
+                }
+                res => res.unwrap(),
+            };
+
+            let mut mem = vec![0; 4096];
+            Snapshot::new(block.save())
+                .save(&mut mem.as_mut_slice())
+                .unwrap();
+            let restored_block = VirtioBlock::restore(
+                BlockConstructorArgs { mem: default_mem() },
+                &Snapshot::load_without_crc_check(mem.as_slice())
+                    .unwrap()
+                    .data,
+            )
+            .unwrap();
+
+            // Direct I/O is recovered from the advertised block size feature.
+            assert_eq!(restored_block.avail_features(), block.avail_features());
+            assert_eq!(restored_block.disk.direct_align, block.disk.direct_align);
+            assert_eq!(restored_block.config_space, block.config_space);
+            assert!(restored_block.config().direct);
+            assert_eq!(restored_block.file_engine_type(), engine);
+        }
     }
 }

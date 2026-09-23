@@ -1255,6 +1255,14 @@ definitions:
           This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
         enum: ["Sync", "Async"]
         default: "Sync"
+      direct:
+        type: boolean
+        description:
+          Opens the backing file with O_DIRECT, bypassing the host page cache, and advertises
+          its logical block size to the guest. Requests must be whole blocks at block-aligned
+          offsets. The backing file cannot be replaced after boot. This field is optional for
+          virtio-block config and should be omitted for vhost-user-block configuration.
+        default: false
 
       # VhostUserBlock specific parameters
       socket:

@@ -9,18 +9,24 @@ use std::os::unix::io::AsRawFd;
 use vm_memory::GuestMemoryError;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::devices::virtio::block::virtio::io::RequestError;
+use crate::devices::virtio::block::virtio::io::{
+    AlignedBuf, DirectIoError, RequestError, direct_io_bounce,
+};
 use crate::devices::virtio::block::virtio::{IO_URING_NUM_ENTRIES, PendingRequest};
 use crate::io_uring::operation::{Cqe, OpCode, Operation};
 use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
-use crate::logger::log_dev_preview_warning;
-use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
+use crate::logger::{error, log_dev_preview_warning};
+use crate::vstate::memory::{
+    Bytes, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap,
+};
 
 const MAX_OUTSTANDING_OPS: u32 = 16;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum AsyncIoError {
+    /// Direct I/O: {0}
+    DirectIo(DirectIoError),
     /// IO: {0}
     IO(std::io::Error),
     /// IoUring: {0}
@@ -40,32 +46,58 @@ pub struct AsyncFileEngine {
     file: File,
     ring: IoUring<WrappedRequest>,
     completion_evt: EventFd,
+    direct_align: Option<u32>,
 }
 
 #[derive(Debug)]
 pub struct WrappedRequest {
     addr: Option<GuestAddress>,
     req: PendingRequest,
+    // Aligned buffer the kernel reads from or writes to in place of guest memory.
+    // It must outlive the operation, so it travels with the request.
+    bounce: Option<AlignedBuf>,
 }
 
 impl WrappedRequest {
-    fn new(req: PendingRequest) -> Self {
-        WrappedRequest { addr: None, req }
+    fn new(req: PendingRequest, bounce: Option<AlignedBuf>) -> Self {
+        WrappedRequest {
+            addr: None,
+            req,
+            bounce,
+        }
     }
 
-    fn new_with_dirty_tracking(addr: GuestAddress, req: PendingRequest) -> Self {
+    fn new_with_dirty_tracking(
+        addr: GuestAddress,
+        req: PendingRequest,
+        bounce: Option<AlignedBuf>,
+    ) -> Self {
         WrappedRequest {
             addr: Some(addr),
             req,
+            bounce,
         }
     }
 
-    fn mark_dirty_mem_and_unwrap(self, mem: &GuestMemoryMmap, count: u32) -> PendingRequest {
+    /// Completes a read into guest memory. Returns false if a bounced read could not be copied.
+    fn mark_dirty_mem_and_unwrap(
+        self,
+        mem: &GuestMemoryMmap,
+        count: u32,
+    ) -> (PendingRequest, bool) {
+        let mut copied = true;
         if let Some(addr) = self.addr {
+            if let Some(bounce) = &self.bounce {
+                let data = &bounce.as_slice()[..(count as usize).min(bounce.as_slice().len())];
+                if let Err(err) = mem.write_slice(data, addr) {
+                    error!("Failed to copy direct I/O bounce buffer to guest memory: {err}");
+                    copied = false;
+                }
+            }
             mem.mark_dirty(addr, count as usize)
         }
 
-        self.req
+        (self.req, copied)
     }
 }
 
@@ -89,7 +121,10 @@ impl AsyncFileEngine {
         )
     }
 
-    pub fn from_file(file: File) -> Result<AsyncFileEngine, AsyncIoError> {
+    pub fn from_file(
+        file: File,
+        direct_align: Option<u32>,
+    ) -> Result<AsyncFileEngine, AsyncIoError> {
         log_dev_preview_warning("Async file IO", Option::None);
 
         let completion_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(AsyncIoError::EventFd)?;
@@ -100,6 +135,7 @@ impl AsyncFileEngine {
             file,
             ring,
             completion_evt,
+            direct_align,
         })
     }
 
@@ -114,6 +150,19 @@ impl AsyncFileEngine {
     pub fn is_throttled(&self) -> bool {
         // Include queued operations and completions not yet consumed by the device.
         self.ring.num_ops() >= MAX_OUTSTANDING_OPS
+    }
+
+    /// Returns a bounce buffer if a direct I/O request cannot use the guest buffer in place.
+    fn direct_bounce(
+        &self,
+        offset: u64,
+        host_addr: usize,
+        count: u32,
+    ) -> Result<Option<AlignedBuf>, DirectIoError> {
+        match self.direct_align {
+            Some(align) => direct_io_bounce(align, offset, host_addr, count),
+            None => Ok(None),
+        }
     }
 
     pub fn push_read(
@@ -134,16 +183,23 @@ impl AsyncFileEngine {
             }
         };
 
-        let wrapped_user_data = WrappedRequest::new_with_dirty_tracking(addr, req);
+        let mut bounce = match self.direct_bounce(offset, buf as usize, count) {
+            Ok(bounce) => bounce,
+            Err(err) => {
+                return Err(RequestError {
+                    req,
+                    error: AsyncIoError::DirectIo(err),
+                });
+            }
+        };
+        // The kernel writes the read into the bounce buffer, so take a mutable pointer.
+        let target = bounce
+            .as_mut()
+            .map_or(buf as usize, |b| b.as_mut_slice().as_mut_ptr() as usize);
+        let wrapped_user_data = WrappedRequest::new_with_dirty_tracking(addr, req, bounce);
 
         self.ring
-            .push(Operation::read(
-                0,
-                buf as usize,
-                count,
-                offset,
-                wrapped_user_data,
-            ))
+            .push(Operation::read(0, target, count, offset, wrapped_user_data))
             .map_err(|(io_uring_error, data)| RequestError {
                 req: data.req,
                 error: AsyncIoError::IoUring(io_uring_error),
@@ -168,12 +224,32 @@ impl AsyncFileEngine {
             }
         };
 
-        let wrapped_user_data = WrappedRequest::new(req);
+        let mut bounce = match self.direct_bounce(offset, buf as usize, count) {
+            Ok(bounce) => bounce,
+            Err(err) => {
+                return Err(RequestError {
+                    req,
+                    error: AsyncIoError::DirectIo(err),
+                });
+            }
+        };
+        if let Some(bounce) = bounce.as_mut()
+            && let Err(err) = mem.read_slice(bounce.as_mut_slice(), addr)
+        {
+            return Err(RequestError {
+                req,
+                error: AsyncIoError::GuestMemory(err),
+            });
+        }
+        let source = bounce
+            .as_ref()
+            .map_or(buf as usize, |b| b.as_slice().as_ptr() as usize);
+        let wrapped_user_data = WrappedRequest::new(req, bounce);
 
         self.ring
             .push(Operation::write(
                 0,
-                buf as usize,
+                source,
                 count,
                 offset,
                 wrapped_user_data,
@@ -185,7 +261,7 @@ impl AsyncFileEngine {
     }
 
     pub fn push_flush(&mut self, req: PendingRequest) -> Result<(), RequestError<AsyncIoError>> {
-        let wrapped_user_data = WrappedRequest::new(req);
+        let wrapped_user_data = WrappedRequest::new(req, None);
 
         self.ring
             .push(Operation::fsync(0, wrapped_user_data))
@@ -237,9 +313,18 @@ impl AsyncFileEngine {
     ) -> Result<Option<Cqe<PendingRequest>>, AsyncIoError> {
         let cqe = self.do_pop()?.map(|cqe| {
             let count = cqe.count();
-            cqe.map_user_data(|wrapped_user_data| {
-                wrapped_user_data.mark_dirty_mem_and_unwrap(mem, count)
-            })
+            let mut copied = true;
+            let cqe = cqe.map_user_data(|wrapped_user_data| {
+                let (req, ok) = wrapped_user_data.mark_dirty_mem_and_unwrap(mem, count);
+                copied = ok;
+                req
+            });
+            // Never report success for a read whose data did not reach the guest.
+            if copied {
+                cqe
+            } else {
+                Cqe::new(-libc::EIO, cqe.user_data())
+            }
         });
 
         Ok(cqe)
