@@ -8,6 +8,9 @@ use std::path::Path;
 use vmm::seccomp::{BpfThreadMap, DeserializationError, deserialize_binary, get_empty_filters};
 
 const THREAD_CATEGORIES: [&str; 3] = ["vmm", "api", "vcpu"];
+/// Thread categories a filter file may leave out. A missing "block_io" filter, for the threaded
+/// block IO engine's workers, falls back to the "vmm" one, which allows the same IO.
+const OPTIONAL_THREAD_CATEGORIES: [&str; 1] = ["block_io"];
 
 /// Error retrieving seccomp filters.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -78,9 +81,11 @@ fn get_custom_filters<R: Read + Debug>(reader: R) -> Result<BpfThreadMap, Filter
 
 /// Return an error if the BpfThreadMap contains invalid thread categories.
 fn filter_thread_categories(map: BpfThreadMap) -> Result<BpfThreadMap, FilterError> {
-    let (filters, invalid_filters): (BpfThreadMap, BpfThreadMap) = map
-        .into_iter()
-        .partition(|(k, _)| THREAD_CATEGORIES.contains(&k.as_str()));
+    let (filters, invalid_filters): (BpfThreadMap, BpfThreadMap) =
+        map.into_iter().partition(|(k, _)| {
+            THREAD_CATEGORIES.contains(&k.as_str())
+                || OPTIONAL_THREAD_CATEGORIES.contains(&k.as_str())
+        });
     if !invalid_filters.is_empty() {
         // build the error message
         let mut thread_categories_string =
@@ -143,6 +148,15 @@ mod tests {
 
         assert_eq!(filter_thread_categories(map).unwrap().len(), 3);
 
+        // correct categories, including the optional ones
+        let mut map = BpfThreadMap::new();
+        map.insert("vcpu".to_string(), Arc::new(vec![]));
+        map.insert("vmm".to_string(), Arc::new(vec![]));
+        map.insert("api".to_string(), Arc::new(vec![]));
+        map.insert("block_io".to_string(), Arc::new(vec![]));
+
+        assert_eq!(filter_thread_categories(map).unwrap().len(), 4);
+
         // invalid categories
         let mut map = BpfThreadMap::new();
         map.insert("vcpu".to_string(), Arc::new(vec![]));
@@ -165,6 +179,15 @@ mod tests {
         match filter_thread_categories(map).unwrap_err() {
             FilterError::MissingThreadCategory(name) => assert_eq!(name, "api"),
             _ => panic!("Expected MissingThreadCategory error."),
+        }
+    }
+
+    #[test]
+    fn test_default_filters() {
+        // Debug builds compile an empty policy, so only release builds check the real one.
+        let filters = get_default_filters().unwrap();
+        for category in THREAD_CATEGORIES.iter().chain(&OPTIONAL_THREAD_CATEGORIES) {
+            assert!(filters.contains_key(*category), "missing {category}");
         }
     }
 
