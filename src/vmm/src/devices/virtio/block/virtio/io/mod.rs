@@ -390,6 +390,36 @@ pub mod tests {
     }
 
     #[test]
+    fn test_sync_signals_every_completion() {
+        let mem = create_mem();
+        let file = TempFile::new().unwrap().into_file();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Sync).unwrap();
+
+        // Queue ops that complete nothing behind a request: the worker must still signal the
+        // request's completion before it goes idle.
+        assert_queued!(engine.write(
+            0,
+            &mem,
+            GuestAddress(0),
+            FILE_LEN,
+            PendingRequest::default()
+        ));
+        engine
+            .update_file_path(TempFile::new().unwrap().into_file())
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.completion_evt().read().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "completion never signalled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(engine.pop(&mem).unwrap().unwrap().result.unwrap(), FILE_LEN);
+    }
+
+    #[test]
     fn test_sync_throttling() {
         let mem = create_mem();
         let file = TempFile::new().unwrap().into_file();

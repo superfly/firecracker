@@ -5,13 +5,14 @@
 //!
 //! The I/O itself is done with blocking system calls, but not on the thread that submits it: each
 //! engine owns a worker thread that performs the requests one at a time, in submission order, and
-//! reports each completion through an eventfd, the same way the async engine does. This keeps a
+//! reports completions through an eventfd, the same way the async engine does. This keeps a
 //! slow backing file from stalling the event loop, and with it every other device serviced there.
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use vm_memory::{GuestMemoryError, ReadVolatile, WriteVolatile};
 use vmm_sys_util::eventfd::EventFd;
@@ -168,7 +169,21 @@ fn run_worker(
         panic!("Failed to set the requested seccomp filters on the block IO worker: {err}");
     }
 
-    for op in ops {
+    let mut signal = CompletionSignal::new(completion_evt);
+    let mut next = None;
+    loop {
+        let op = match next.take() {
+            Some(op) => op,
+            None => {
+                // Never go to sleep on a completion the device has not been told about.
+                signal.flush();
+                match ops.recv() {
+                    Ok(op) => op,
+                    Err(mpsc::RecvError) => break,
+                }
+            }
+        };
+
         let completion = match op {
             Op::Io { io, req } => SyncCompletion {
                 req,
@@ -189,9 +204,60 @@ fn run_worker(
         if completions.send(completion).is_err() {
             break;
         }
-        if let Err(err) = completion_evt.write(1) {
+        signal.pending = true;
+
+        // Hold the signal back while more requests are queued, so that the device handles a
+        // burst of completions at once instead of raising an interrupt for each. Only while the
+        // previous signal is recent, though: a slow backing file gets one after every request.
+        match ops.try_recv() {
+            Ok(op) => {
+                next = Some(op);
+                signal.maybe_flush();
+            }
+            Err(_) => signal.flush(),
+        }
+    }
+    signal.flush();
+}
+
+/// How long a finished request may wait for the requests queued behind it before the device is
+/// told about it.
+const COMPLETION_SIGNAL_DELAY: Duration = Duration::from_micros(200);
+
+/// Coalesces the completion eventfd writes of the worker thread.
+#[derive(Debug)]
+struct CompletionSignal {
+    evt: EventFd,
+    pending: bool,
+    last: Instant,
+}
+
+impl CompletionSignal {
+    fn new(evt: EventFd) -> Self {
+        CompletionSignal {
+            evt,
+            pending: false,
+            last: Instant::now(),
+        }
+    }
+
+    /// Signal pending completions if the last signal is old enough.
+    fn maybe_flush(&mut self) {
+        if self.last.elapsed() >= COMPLETION_SIGNAL_DELAY {
+            self.flush();
+        }
+    }
+
+    /// Signal pending completions.
+    fn flush(&mut self) {
+        if !self.pending {
+            return;
+        }
+        if let Err(err) = self.evt.write(1) {
             error!("Failed to signal block IO completion: {:?}", err);
         }
+        self.pending = false;
+        self.last = Instant::now();
     }
 }
 
