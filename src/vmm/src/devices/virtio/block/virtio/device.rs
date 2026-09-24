@@ -50,6 +50,8 @@ pub enum FileEngineType {
     /// Use a Sync engine, based on blocking system calls.
     #[default]
     Sync,
+    /// Use a Threaded engine: blocking system calls, made from a worker thread per drive.
+    Threaded,
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
@@ -272,7 +274,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
+            _ => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -560,6 +562,7 @@ impl VirtioBlock {
         match self.disk.file_engine {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
+            FileEngine::Threaded(_) => FileEngineType::Threaded,
         }
     }
 
@@ -579,6 +582,7 @@ impl VirtioBlock {
         if let FileEngine::Async(ref _engine) = self.disk.file_engine {
             self.process_async_completion_queue();
         }
+        self.process_threaded_completion_queue();
     }
 }
 

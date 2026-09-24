@@ -1094,5 +1094,168 @@
                 ]
             }
         ]
+    },
+    "block_io": {
+        "default_action": "trap",
+        "filter_action": "allow",
+        "filter": [
+            {
+                "syscall": "exit"
+            },
+            {
+                "syscall": "exit_group"
+            },
+            {
+                "syscall": "read",
+                "comment": "Reads from the backing file"
+            },
+            {
+                "syscall": "write",
+                "comment": "Writes to the backing file, and signals completions through an eventfd"
+            },
+            {
+                "syscall": "fsync",
+                "comment": "Flush requests"
+            },
+            {
+                "syscall": "close",
+                "comment": "Closes the previous backing file after a drive update"
+            },
+            {
+                "syscall": "brk",
+                "comment": "Called for expanding the heap"
+            },
+            {
+                "syscall": "clock_gettime",
+                "comment": "Used for metrics and logging, via the helpers in utils/src/time.rs. It's not called on some platforms, because of vdso optimisations."
+            },
+            {
+                "syscall": "lseek",
+                "comment": "Positions the backing file before each read or write"
+            },
+            {
+                "syscall": "mremap",
+                "comment": "Used for re-allocating large memory regions, for example vectors"
+            },
+            {
+                "syscall": "munmap",
+                "comment": "Used for freeing memory"
+            },
+            {
+                "syscall": "rt_sigprocmask",
+                "comment": "rt_sigprocmask is used by libc::abort during a panic to block and unblock signals"
+            },
+            {
+                "syscall": "rt_sigreturn",
+                "comment": "rt_sigreturn is needed in case a fault does occur, so that the signal handler can return. Otherwise we get stuck in a fault loop."
+            },
+            {
+                "syscall": "sigaltstack",
+                "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (during thread teardown when joining multiple vcpu threads at once)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "FUTEX_WAIT"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization (during thread teardown)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "FUTEX_WAKE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 128,
+                        "comment": "FUTEX_WAIT_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 137,
+                        "comment": "FUTEX_WAIT_BITSET_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "futex",
+                "comment": "Used for synchronization",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 129,
+                        "comment": "FUTEX_WAKE_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "madvise",
+                "comment": "Used by the VirtIO balloon device and by musl for some customer workloads. It is also used by aws-lc during random number generation. They setup a memory page that mark with MADV_WIPEONFORK to be able to detect forks. They also call it with -1 to see if madvise is supported in certain platforms."
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by the allocator",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 34,
+                        "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "tkill",
+                "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
+            },
+            {
+                "syscall": "sched_yield",
+                "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication"
+            },
+            {
+                "syscall": "restart_syscall",
+                "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
+            }
+        ]
     }
 }
