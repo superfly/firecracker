@@ -24,8 +24,8 @@ use vmm_sys_util::eventfd::EventFd;
 use super::io::async_io;
 use super::request::*;
 use super::{
-    BLOCK_QUEUE_SIZES, MAX_DISCARD_SECTORS, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError,
-    io as block_io,
+    BLOCK_QUEUE_SIZES, MAX_DISCARD_SECTORS, RATE_LIMITER_MIN_REFILL_DELAY, SECTOR_SHIFT,
+    SECTOR_SIZE, VirtioBlockError, io as block_io,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
@@ -439,10 +439,11 @@ impl VirtioBlock {
             config.file_engine_type,
         )?;
 
-        let rate_limiter = config
+        let mut rate_limiter: RateLimiter = config
             .rate_limiter
             .map(RateLimiter::from)
             .unwrap_or_default();
+        rate_limiter.set_min_refill_delay(RATE_LIMITER_MIN_REFILL_DELAY);
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX)
