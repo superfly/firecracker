@@ -313,6 +313,9 @@ paths:
       summary: Updates the properties of a drive. Post-boot only.
       description:
         Updates the properties of the drive with the ID specified by drive_id path parameter.
+        Updating path_on_host is supported only for Sync drives. Async drives reject
+        path_on_host updates, including the current path; use the refresh-size endpoint
+        to refresh their capacity. Rate-limiter updates are supported for both engines.
         Will fail if update is not possible.
       operationId: patchGuestDriveByID
       parameters:
@@ -332,6 +335,34 @@ paths:
           description: Drive updated
         400:
           description: Drive cannot be updated due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
+  /drives/{drive_id}/refresh-size:
+    patch:
+      summary: Refreshes the capacity of a virtio block drive. Post-boot only.
+      description:
+        Reads the current size through the existing backing file descriptor, updates
+        the capacity advertised to the guest, and sends a configuration-change interrupt.
+        Does not reopen the backing path, replace the IO engine, or modify the backing file.
+        Async IO rings, registered files, and pending requests are retained.
+        The request must have no body. Vhost-user drives are not supported.
+      operationId: refreshGuestDriveSizeByID
+      parameters:
+        - name: drive_id
+          in: path
+          description: The id of the guest drive
+          required: true
+          type: string
+      responses:
+        204:
+          description: Drive capacity refreshed and guest notified
+        400:
+          description: Invalid request, unknown drive, unsupported backend, or refresh failed
           schema:
             $ref: "#/definitions/Error"
         default:
@@ -1224,6 +1255,14 @@ definitions:
           This field is optional for virtio-block config and should be omitted for vhost-user-block configuration.
         enum: ["Sync", "Async"]
         default: "Sync"
+      direct:
+        type: boolean
+        description:
+          Opens the backing file with O_DIRECT, bypassing the host page cache, and advertises
+          its logical block size to the guest. Requests must be whole blocks at block-aligned
+          offsets. The backing file cannot be replaced after boot. This field is optional for
+          virtio-block config and should be omitted for vhost-user-block configuration.
+        default: false
 
       # VhostUserBlock specific parameters
       socket:

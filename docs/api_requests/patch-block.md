@@ -1,6 +1,39 @@
 # Updating block devices after boot
 
+## Refreshing the size of an existing Virtio block device
+
+After resizing the backing file or block device on the host, call
+`PATCH /drives/{drive_id}/refresh-size` with no request body:
+
+```bash
+curl --unix-socket "${socket}" -i \
+     -X PATCH "http://localhost/drives/scratch/refresh-size"
+```
+
+This post-boot operation reads the current size through the already-open backing
+file descriptor, updates the sector count and virtio capacity, and notifies the
+guest with a configuration-change interrupt. It returns `204` on success. The
+backing file descriptor, disk identity, IO engine, async ring, registered files,
+and pending IO requests are retained, even if the backing pathname has been
+removed or replaced. Both Sync and Async engines and read-only drives are
+supported. Partial sectors are not exposed to the guest.
+
+The operation does not resize the host device or the guest filesystem. Grow the
+host device first, refresh its capacity, then wait for the guest to observe the
+new capacity before growing its filesystem. Shrinking requires the caller to
+coordinate guest IO and filesystem changes to avoid data loss.
+
+Requests before boot, unknown drive IDs, vhost-user drives, nonempty request
+bodies, and failures to query or notify the device return `400`. For vhost-user
+drives, use the existing `PATCH /drives/{drive_id}` operation described below.
+
 ## Updating Virtio block devices after boot
+
+Replacing `path_on_host` is supported only for `Sync` drives. For `Async`
+drives, `PATCH /drives/{drive_id}` requests containing `path_on_host` return
+`400`, including requests that repeat the existing path. Use
+`PATCH /drives/{drive_id}/refresh-size` after growing the existing backing
+device. Rate-limiter updates remain supported for both engines.
 
 Firecracker offers support to update attached block devices after the microVM
 has been started. This is provided via PATCH /drives API which notifies

@@ -60,6 +60,10 @@ pub struct BlockDeviceConfig {
     // pub file_engine_type: FileEngineType,
     #[serde(rename = "io_engine")]
     pub file_engine_type: Option<FileEngineType>,
+    /// If set to true, the drive is opened with `O_DIRECT`, bypassing the host page cache, and
+    /// its logical block size is advertised to the guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct: Option<bool>,
 
     // VhostUserBlock specific fields
     /// Path to the vhost-user socket.
@@ -212,6 +216,7 @@ mod tests {
                 path_on_host: self.path_on_host.clone(),
                 rate_limiter: self.rate_limiter,
                 file_engine_type: self.file_engine_type,
+                direct: self.direct,
 
                 socket: self.socket.clone(),
             }
@@ -239,6 +244,7 @@ mod tests {
             path_on_host: Some(dummy_path),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -273,6 +279,7 @@ mod tests {
             path_on_host: Some(dummy_path),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -305,6 +312,7 @@ mod tests {
             path_on_host: Some(dummy_path),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -334,6 +342,7 @@ mod tests {
             path_on_host: Some(dummy_path_1),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -350,6 +359,7 @@ mod tests {
             path_on_host: Some(dummy_path_2),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -377,6 +387,7 @@ mod tests {
             path_on_host: Some(dummy_path_1),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -393,6 +404,7 @@ mod tests {
             path_on_host: Some(dummy_path_2),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -409,6 +421,7 @@ mod tests {
             path_on_host: Some(dummy_path_3),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -450,6 +463,7 @@ mod tests {
             path_on_host: Some(dummy_path_1),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -466,6 +480,7 @@ mod tests {
             path_on_host: Some(dummy_path_2),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -482,6 +497,7 @@ mod tests {
             path_on_host: Some(dummy_path_3),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -524,6 +540,7 @@ mod tests {
             path_on_host: Some(dummy_path_1.clone()),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -540,6 +557,7 @@ mod tests {
             path_on_host: Some(dummy_path_2.clone()),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -612,6 +630,7 @@ mod tests {
             path_on_host: Some(dummy_path_1),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -628,6 +647,7 @@ mod tests {
             path_on_host: Some(dummy_path_2),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -654,6 +674,7 @@ mod tests {
             path_on_host: Some(dummy_file.as_path().to_str().unwrap().to_string()),
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
+            direct: None,
 
             socket: None,
         };
@@ -684,6 +705,7 @@ mod tests {
             path_on_host: Some(backing_file.as_path().to_str().unwrap().to_string()),
             rate_limiter: None,
             file_engine_type: None,
+            direct: None,
 
             socket: None,
         };
@@ -696,5 +718,22 @@ mod tests {
             block_devs.devices.pop_back().unwrap().lock().unwrap().id(),
             block_id
         );
+    }
+
+    #[test]
+    fn test_direct_io_serde() {
+        let config: BlockDeviceConfig = serde_json::from_str(
+            r#"{"drive_id":"data","path_on_host":"disk","is_root_device":false,"direct":true}"#,
+        )
+        .unwrap();
+        assert_eq!(config.direct, Some(true));
+
+        // Drives without direct I/O serialize as before.
+        let config: BlockDeviceConfig = serde_json::from_str(
+            r#"{"drive_id":"data","path_on_host":"disk","is_root_device":false}"#,
+        )
+        .unwrap();
+        assert_eq!(config.direct, None);
+        assert!(!serde_json::to_string(&config).unwrap().contains("direct"));
     }
 }

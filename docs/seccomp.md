@@ -36,6 +36,20 @@ For a certain release, the default JSON filters used to build Firecracker are
 also included in the respective release archive, viewable on the
 [releases page](https://github.com/firecracker-microvm/firecracker/releases).
 
+## Async block IO
+
+The default x86_64 and aarch64 runtime policies deny `io_uring_setup` and
+`io_uring_register` on VMM, API, and vCPU threads. Only the VMM may call
+`io_uring_enter`. Async block devices initialize their restricted rings and
+register their backing files before the VMM policy is installed, on both cold
+boot and snapshot restore. Runtime capacity refresh uses the existing backing
+file; replacing an Async backing file is rejected by the drive API.
+
+The optional GDB feature starts an unfiltered debugger thread and is outside
+this production policy. Debug builds, GNU targets without default filters,
+`--no-seccomp`, and custom filters do not provide the default policy's
+guarantees.
+
 ## Custom filters (advanced users only)
 
 > [!NOTE]

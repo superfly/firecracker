@@ -350,6 +350,8 @@ pub fn build_microvm_for_boot(
     }
 
     // Load seccomp filters for the VMM thread.
+    // All async block rings and fixed-file registrations must be ready here: the
+    // default runtime policy denies io_uring_setup and io_uring_register.
     // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
     // altogether is the desired behaviour.
     // Keep this as the last step before resuming vcpus.
@@ -539,6 +541,8 @@ pub fn build_microvm_from_snapshot(
     event_manager.add_subscriber(vmm.clone());
 
     // Load seccomp filters for the VMM thread.
+    // Device restoration above recreates async rings and registers their backing
+    // files before the default runtime policy denies setup and registration.
     // Keep this as the last step of the building process.
     crate::seccomp::apply_filter(
         seccomp_filters
@@ -874,6 +878,7 @@ pub(crate) mod tests {
                 ),
                 rate_limiter: None,
                 file_engine_type: None,
+                direct: None,
 
                 socket: None,
             };

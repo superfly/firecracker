@@ -776,6 +776,13 @@ def _drive_patch(test_microvm, io_engine):
     with pytest.raises(RuntimeError, match=expected_msg):
         test_microvm.api.drive.patch(drive_id="scratch")
 
+    # Capacity refresh is only supported by the virtio block backend.
+    response = test_microvm.api.session.patch(
+        test_microvm.api.endpoint + "/drives/scratch_vub/refresh-size"
+    )
+    assert response.status_code == 400, response.text
+    assert expected_msg in response.json()["fault_message"]
+
     # Patches with any fields for vhost-user block are not allowed.
     with pytest.raises(RuntimeError, match=expected_msg):
         test_microvm.api.drive.patch(
@@ -815,24 +822,32 @@ def _drive_patch(test_microvm, io_engine):
 
     # Updates to `path_on_host` with an invalid path are not allowed.
     expected_msg = f"Error manipulating the backing file: No such file or directory (os error 2) {drive_path}"
+    if io_engine == "Async":
+        expected_msg = "Async backing file replacement is unsupported"
     with pytest.raises(RuntimeError, match=re.escape(expected_msg)):
         test_microvm.api.drive.patch(drive_id="scratch", path_on_host=drive_path)
 
     fs = drive_tools.FilesystemFile(os.path.join(test_microvm.fsfiles, "scratch_new"))
-    # Updates to `path_on_host` with a valid path are allowed.
-    test_microvm.api.drive.patch(
-        drive_id="scratch", path_on_host=test_microvm.create_jailed_resource(fs.path)
-    )
-
-    # Updates to valid `path_on_host` and `rate_limiter` are allowed.
-    test_microvm.api.drive.patch(
-        drive_id="scratch",
-        path_on_host=test_microvm.create_jailed_resource(fs.path),
-        rate_limiter={
+    # Only Sync drives permit backing-file replacement, including combined updates.
+    for rate_limiter in [
+        None,
+        {
             "bandwidth": {"size": 1000000, "refill_time": 100},
             "ops": {"size": 1, "refill_time": 100},
         },
-    )
+    ]:
+        update = {
+            "drive_id": "scratch",
+            "path_on_host": test_microvm.create_jailed_resource(fs.path),
+            "rate_limiter": rate_limiter,
+        }
+        if io_engine == "Async":
+            before = test_microvm.api.vm_config.get().json()
+            with pytest.raises(RuntimeError, match="refresh-size"):
+                test_microvm.api.drive.patch(**update)
+            assert test_microvm.api.vm_config.get().json() == before
+        else:
+            test_microvm.api.drive.patch(**update)
 
     # Updates to `rate_limiter` only are allowed.
     test_microvm.api.drive.patch(
@@ -844,7 +859,7 @@ def _drive_patch(test_microvm, io_engine):
     )
 
     # Updates to `rate_limiter` and invalid path fail.
-    with pytest.raises(RuntimeError, match="No such file or directory"):
+    with pytest.raises(RuntimeError, match=re.escape(expected_msg)):
         test_microvm.api.drive.patch(
             drive_id="scratch",
             path_on_host="foo.bar",
@@ -874,7 +889,9 @@ def _drive_patch(test_microvm, io_engine):
             "is_root_device": False,
             "cache_type": "Unsafe",
             "is_read_only": False,
-            "path_on_host": "/scratch_new.ext4",
+            "path_on_host": (
+                "/scratch.ext4" if io_engine == "Async" else "/scratch_new.ext4"
+            ),
             "rate_limiter": {
                 "bandwidth": {"size": 5000, "one_time_burst": None, "refill_time": 100},
                 "ops": {"size": 500, "one_time_burst": None, "refill_time": 100},

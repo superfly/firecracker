@@ -29,10 +29,19 @@ pub const BLOCK_QUEUE_SIZES: [u16; BLOCK_NUM_QUEUES] = [FIRECRACKER_MAX_QUEUE_SI
 // So we can use 128 IO_URING entries without ever triggering a FullSq Error.
 /// Maximum number of io uring entries we allow in the queue.
 pub const IO_URING_NUM_ENTRIES: u16 = 128;
+/// Minimum wait before retrying a depleted rate limiter. The limiter otherwise waits
+/// until the failed request's tokens have refilled, rather than a fixed 100ms.
+pub const RATE_LIMITER_MIN_REFILL_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Errors the block device can trigger.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VirtioBlockError {
+    /// Async backing file replacement is unsupported; use the drive's refresh-size endpoint.
+    AsyncBackingFileUpdate,
+    /// Direct I/O backing file replacement is unsupported; use the drive's refresh-size endpoint.
+    DirectBackingFileUpdate,
+    /// Unsupported logical block size for direct I/O: {0}
+    DirectIoBlockSize(i32),
     /// Cannot create config
     Config,
     /// Guest gave us too few descriptors in a descriptor chain.
@@ -57,8 +66,8 @@ pub enum VirtioBlockError {
     BackingFile(std::io::Error, String),
     /// Error opening eventfd: {0}
     EventFd(std::io::Error),
-    /// Error creating an interrupt: {0}
-    Interrupt(std::io::Error),
+    /// Error triggering an interrupt: {0}
+    Interrupt(crate::vstate::interrupts::InterruptError),
     /// Error coming from the rate limiter: {0}
     RateLimiter(std::io::Error),
     /// Persistence error: {0}

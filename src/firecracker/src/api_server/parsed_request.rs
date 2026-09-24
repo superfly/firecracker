@@ -14,7 +14,7 @@ use super::request::actions::parse_put_actions;
 use super::request::balloon::{parse_get_balloon, parse_patch_balloon, parse_put_balloon};
 use super::request::boot_source::parse_put_boot_source;
 use super::request::cpu_configuration::parse_put_cpu_config;
-use super::request::drive::{parse_patch_drive, parse_put_drive};
+use super::request::drive::{parse_patch_drive, parse_put_drive, parse_refresh_drive_size};
 use super::request::entropy::parse_put_entropy;
 use super::request::instance_info::parse_get_instance_info;
 use super::request::logger::parse_put_logger;
@@ -96,7 +96,9 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
             (Method::Put, "boot-source", Some(body)) => parse_put_boot_source(body),
             (Method::Put, "cpu-config", Some(body)) => parse_put_cpu_config(body),
-            (Method::Put, "drives", Some(body)) => parse_put_drive(body, path_tokens.next()),
+            (Method::Put, "drives", Some(body)) if path_tokens.clone().count() <= 1 => {
+                parse_put_drive(body, path_tokens.next())
+            }
             (Method::Put, "pmem", Some(body)) => parse_put_pmem(body, path_tokens.next()),
             (Method::Put, "logger", Some(body)) => parse_put_logger(body),
             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
@@ -114,7 +116,15 @@ impl TryFrom<&Request> for ParsedRequest {
             }
             (Method::Put, _, None) => method_to_error(Method::Put),
             (Method::Patch, "balloon", body) => parse_patch_balloon(body, path_tokens),
-            (Method::Patch, "drives", Some(body)) => parse_patch_drive(body, path_tokens.next()),
+            (Method::Patch, "drives", body) => {
+                let id = path_tokens.next();
+                match (path_tokens.next(), path_tokens.next(), body) {
+                    (Some("refresh-size"), None, body) => parse_refresh_drive_size(body, id),
+                    (None, None, Some(body)) => parse_patch_drive(body, id),
+                    (None, None, None) => method_to_error(Method::Patch),
+                    _ => Err(RequestError::InvalidPathMethod(request_uri, Method::Patch)),
+                }
+            }
             (Method::Patch, "machine-config", Some(body)) => parse_patch_machine_config(body),
             (Method::Patch, "mmds", Some(body)) => parse_patch_mmds(body),
             (Method::Patch, "network-interfaces", Some(body)) => {
@@ -797,6 +807,50 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_refresh_drive_size() {
+        for (method, path, body, valid) in [
+            ("PATCH", "/drives/scratch/refresh-size", None, true),
+            ("PATCH", "/drives/scratch/refresh-size", Some(""), true),
+            ("PATCH", "/drives/scratch/refresh-size", Some("{}"), false),
+            ("PATCH", "/drives//refresh-size", None, false),
+            ("PATCH", "/drives/invalid-id/refresh-size", None, false),
+            ("PATCH", "/drives/scratch/refresh-size/extra", None, false),
+            ("PATCH", "/drives/scratch/unknown", None, false),
+            ("GET", "/drives/scratch/refresh-size", None, false),
+            ("PUT", "/drives/scratch/refresh-size", None, false),
+            (
+                "PUT",
+                "/drives/scratch/refresh-size",
+                Some(
+                    r#"{"drive_id":"scratch","path_on_host":"disk","is_root_device":false,"is_read_only":false}"#,
+                ),
+                false,
+            ),
+            (
+                "PATCH",
+                "/drives/scratch/refresh-size",
+                Some(r#"{"drive_id":"scratch","path_on_host":"disk"}"#),
+                false,
+            ),
+        ] {
+            let (mut sender, receiver) = UnixStream::pair().unwrap();
+            let mut connection = HttpConnection::new(receiver);
+            sender
+                .write_all(http_request(method, path, body).as_bytes())
+                .unwrap();
+            connection.try_read().unwrap();
+            let req = connection.pop_parsed_request().unwrap();
+            let result = ParsedRequest::try_from(&req);
+            if valid {
+                result.unwrap();
+            } else {
+                let response = Response::from(result.unwrap_err());
+                assert_eq!(response.status(), StatusCode::BadRequest);
+            }
+        }
     }
 
     #[test]

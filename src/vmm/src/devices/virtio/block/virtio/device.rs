@@ -11,6 +11,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::linux::fs::MetadataExt;
+use std::os::raw::c_int;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,16 +20,21 @@ use block_io::FileEngine;
 use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::ioctl::ioctl_with_mut_ref;
+use vmm_sys_util::ioctl_io_nr;
 
 use super::io::async_io;
 use super::request::*;
-use super::{BLOCK_QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError, io as block_io};
+use super::{
+    BLOCK_QUEUE_SIZES, RATE_LIMITER_MIN_REFILL_DELAY, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError,
+    io as block_io,
+};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMetricsPerDevice};
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice};
 use crate::devices::virtio::generated::virtio_blk::{
-    VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_ID_BYTES,
+    VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_ID_BYTES,
 };
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BLOCK;
@@ -37,7 +44,7 @@ use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::impl_device_type;
 use crate::logger::{IncMetric, error, warn};
 use crate::rate_limiter::{BucketUpdate, RateLimiter};
-use crate::utils::u64_to_usize;
+use crate::utils::{align_down, u64_to_usize};
 use crate::vmm_config::RateLimiterConfig;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -52,6 +59,12 @@ pub enum FileEngineType {
     Sync,
 }
 
+// Logical block size of a block device, in bytes.
+ioctl_io_nr!(BLKSSZGET, 0x12, 104);
+
+/// Direct I/O alignment used for regular files, whose filesystem block size is not queried.
+const DIRECT_IO_FILE_ALIGN: u32 = 4096;
+
 /// Helper object for setting up all `Block` fields derived from its backing file.
 #[derive(Debug)]
 pub struct DiskProperties {
@@ -59,20 +72,59 @@ pub struct DiskProperties {
     pub file_engine: FileEngine,
     pub nsectors: u64,
     pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    /// Alignment required by `O_DIRECT`, or `None` when I/O goes through the host page cache.
+    pub direct_align: Option<u32>,
 }
 
 impl DiskProperties {
     // Helper function that opens the file with the proper access permissions
-    fn open_file(disk_image_path: &str, is_disk_read_only: bool) -> Result<File, VirtioBlockError> {
-        OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
+    fn open_file(
+        disk_image_path: &str,
+        is_disk_read_only: bool,
+        direct: bool,
+    ) -> Result<File, VirtioBlockError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(!is_disk_read_only);
+        if direct {
+            options.custom_flags(libc::O_DIRECT);
+        }
+        options
             .open(PathBuf::from(&disk_image_path))
             .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))
     }
 
+    /// Returns the alignment `O_DIRECT` requires on `disk_image`: the logical block size of a
+    /// block device, or a page for a regular file.
+    fn direct_io_align(disk_image_path: &str, disk_image: &File) -> Result<u32, VirtioBlockError> {
+        let metadata = disk_image
+            .metadata()
+            .map_err(VirtioBlockError::GetFileMetadata)?;
+        if !metadata.file_type().is_block_device() {
+            return Ok(DIRECT_IO_FILE_ALIGN);
+        }
+
+        let mut block_size: c_int = 0;
+        // SAFETY: `disk_image` is an open block device and BLKSSZGET writes one c_int.
+        if unsafe { ioctl_with_mut_ref(disk_image, BLKSSZGET(), &mut block_size) } < 0 {
+            return Err(VirtioBlockError::BackingFile(
+                std::io::Error::last_os_error(),
+                disk_image_path.to_string(),
+            ));
+        }
+        u32::try_from(block_size)
+            .ok()
+            .filter(|size| size.is_power_of_two() && *size >= SECTOR_SIZE)
+            .ok_or(VirtioBlockError::DirectIoBlockSize(block_size))
+    }
+
+    // Direct I/O cannot address a partial block, so the guest does not see one.
+    fn nsectors(disk_size: u64, direct_align: Option<u32>) -> u64 {
+        direct_align.map_or(disk_size, |align| align_down(disk_size, u64::from(align)))
+            >> SECTOR_SHIFT
+    }
+
     // Helper function that gets the size of the file
-    fn file_size(disk_image_path: &str, disk_image: &mut File) -> Result<u64, VirtioBlockError> {
+    fn file_size(disk_image_path: &str, mut disk_image: &File) -> Result<u64, VirtioBlockError> {
         let disk_size = disk_image
             .seek(SeekFrom::End(0))
             .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))?;
@@ -95,17 +147,22 @@ impl DiskProperties {
         disk_image_path: String,
         is_disk_read_only: bool,
         file_engine_type: FileEngineType,
+        direct: bool,
     ) -> Result<Self, VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
-        let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
+        let disk_image = Self::open_file(&disk_image_path, is_disk_read_only, direct)?;
+        let disk_size = Self::file_size(&disk_image_path, &disk_image)?;
         let image_id = Self::build_disk_image_id(&disk_image);
+        let direct_align = direct
+            .then(|| Self::direct_io_align(&disk_image_path, &disk_image))
+            .transpose()?;
 
         Ok(Self {
             file_path: disk_image_path,
-            file_engine: FileEngine::from_file(disk_image, file_engine_type)
+            file_engine: FileEngine::from_file(disk_image, file_engine_type, direct_align)
                 .map_err(VirtioBlockError::FileEngine)?,
-            nsectors: disk_size >> SECTOR_SHIFT,
+            nsectors: Self::nsectors(disk_size, direct_align),
             image_id,
+            direct_align,
         })
     }
 
@@ -115,16 +172,31 @@ impl DiskProperties {
         disk_image_path: String,
         is_disk_read_only: bool,
     ) -> Result<(), VirtioBlockError> {
-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
-        let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
+        // Async rings and their registered backing files are fixed before the VMM's
+        // runtime seccomp filter is installed. Reject replacement before opening a file.
+        let FileEngine::Sync(engine) = &mut self.file_engine else {
+            return Err(VirtioBlockError::AsyncBackingFileUpdate);
+        };
+        // The guest keeps the block size advertised at boot, and querying a new file's block
+        // size needs an ioctl the runtime seccomp filter does not allow.
+        if self.direct_align.is_some() {
+            return Err(VirtioBlockError::DirectBackingFileUpdate);
+        }
+        let disk_image = Self::open_file(&disk_image_path, is_disk_read_only, false)?;
+        let disk_size = Self::file_size(&disk_image_path, &disk_image)?;
 
         self.image_id = Self::build_disk_image_id(&disk_image);
-        self.file_engine
-            .update_file_path(disk_image)
-            .map_err(VirtioBlockError::FileEngine)?;
+        engine.update_file(disk_image);
         self.nsectors = disk_size >> SECTOR_SHIFT;
         self.file_path = disk_image_path;
 
+        Ok(())
+    }
+
+    /// Re-read capacity without reopening the file or replacing its IO engine.
+    pub fn refresh_size(&mut self) -> Result<(), VirtioBlockError> {
+        let disk_size = Self::file_size(&self.file_path, self.file_engine.file())?;
+        self.nsectors = Self::nsectors(disk_size, self.direct_align);
         Ok(())
     }
 
@@ -160,10 +232,26 @@ impl DiskProperties {
     }
 }
 
+/// Leading fields of `struct virtio_blk_config`. Only `capacity` and, with
+/// `VIRTIO_BLK_F_BLK_SIZE`, `blk_size` are offered to the guest.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 #[repr(C)]
 pub struct ConfigSpace {
     pub capacity: u64,
+    pub size_max: u32,
+    pub seg_max: u32,
+    pub geometry: [u8; 4],
+    pub blk_size: u32,
+}
+
+impl ConfigSpace {
+    pub fn new(disk: &DiskProperties) -> Self {
+        ConfigSpace {
+            capacity: disk.nsectors.to_le(),
+            blk_size: disk.direct_align.unwrap_or(0).to_le(),
+            ..Default::default()
+        }
+    }
 }
 
 // SAFETY: `ConfigSpace` contains only PODs in `repr(C)` or `repr(transparent)`, without padding.
@@ -198,6 +286,10 @@ pub struct VirtioBlockConfig {
     #[serde(default)]
     #[serde(rename = "io_engine")]
     pub file_engine_type: FileEngineType,
+    /// If set to true, the backing file is opened with `O_DIRECT`, bypassing the host page
+    /// cache, and its logical block size is advertised to the guest.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
@@ -215,6 +307,7 @@ impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
                 path_on_host: value.path_on_host.as_ref().unwrap().clone(),
                 rate_limiter: value.rate_limiter,
                 file_engine_type: value.file_engine_type.unwrap_or_default(),
+                direct: value.direct.unwrap_or(false),
             })
         } else {
             Err(VirtioBlockError::Config)
@@ -234,6 +327,7 @@ impl From<VirtioBlockConfig> for BlockDeviceConfig {
             path_on_host: Some(value.path_on_host),
             rate_limiter: value.rate_limiter,
             file_engine_type: Some(value.file_engine_type),
+            direct: value.direct.then_some(true),
 
             socket: None,
         }
@@ -289,14 +383,16 @@ impl VirtioBlock {
             config.path_on_host,
             config.is_read_only,
             config.file_engine_type,
+            config.direct,
         )?;
 
-        let rate_limiter = config
+        let mut rate_limiter: RateLimiter = config
             .rate_limiter
             .map(RateLimiterConfig::try_into)
             .transpose()
             .map_err(VirtioBlockError::RateLimiter)?
             .unwrap_or_default();
+        rate_limiter.set_min_refill_delay(RATE_LIMITER_MIN_REFILL_DELAY);
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -308,13 +404,16 @@ impl VirtioBlock {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
         };
 
+        // Direct I/O needs block-aligned requests, so tell the guest the block size.
+        if disk_properties.direct_align.is_some() {
+            avail_features |= 1u64 << VIRTIO_BLK_F_BLK_SIZE;
+        }
+
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
 
         let queues = BLOCK_QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
 
-        let config_space = ConfigSpace {
-            capacity: disk_properties.nsectors.to_le(),
-        };
+        let config_space = ConfigSpace::new(&disk_properties);
 
         Ok(VirtioBlock {
             avail_features,
@@ -351,6 +450,7 @@ impl VirtioBlock {
             cache_type: self.cache_type,
             rate_limiter: rl.into_option(),
             file_engine_type: self.file_engine_type(),
+            direct: self.disk.direct_align.is_some(),
         }
     }
 
@@ -395,6 +495,13 @@ impl VirtioBlock {
         let mut used_any = false;
 
         while let Some(head) = queue.pop_or_enable_notification()? {
+            if let FileEngine::Async(engine) = &self.disk.file_engine
+                && engine.is_throttled()
+            {
+                queue.undo_pop();
+                self.is_io_engine_throttled = true;
+                break;
+            }
             self.metrics.remaining_reqs_count.add(queue.len().into());
             let processing_result =
                 match Request::parse(&head, &active_state.mem, self.disk.nsectors) {
@@ -550,6 +657,21 @@ impl VirtioBlock {
         Ok(())
     }
 
+    /// Refresh capacity through the existing backing FD and notify the guest.
+    pub fn refresh_size(&mut self) -> Result<(), VirtioBlockError> {
+        self.disk.refresh_size()?;
+        self.config_space.capacity = self.disk.nsectors.to_le();
+
+        if self.is_activated() {
+            self.interrupt_trigger()
+                .trigger(VirtioInterruptType::Config)
+                .map_err(VirtioBlockError::Interrupt)?;
+        }
+
+        self.metrics.update_count.inc();
+        Ok(())
+    }
+
     /// Updates the parameters for the rate limiter
     pub fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
         self.rate_limiter.update_buckets(bytes, ops);
@@ -690,7 +812,6 @@ impl Drop for VirtioBlock {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::metadata;
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::thread;
@@ -700,11 +821,10 @@ mod tests {
 
     use super::*;
     use crate::check_metric_after_block;
-    use crate::devices::virtio::block::virtio::IO_URING_NUM_ENTRIES;
     use crate::devices::virtio::block::virtio::test_utils::{
-        default_block, read_blk_req_descriptors, set_queue, set_rate_limiter,
-        simulate_async_completion_event, simulate_queue_and_async_completion_events,
-        simulate_queue_event,
+        default_block, default_block_with_path, read_blk_req_descriptors, set_queue,
+        set_rate_limiter, simulate_async_completion_event,
+        simulate_queue_and_async_completion_events, simulate_queue_event,
     };
     use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
@@ -723,6 +843,7 @@ mod tests {
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Default::default(),
+            direct: None,
 
             socket: None,
         };
@@ -738,6 +859,7 @@ mod tests {
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: Default::default(),
+            direct: None,
 
             socket: Some("sock".to_string()),
         };
@@ -753,6 +875,7 @@ mod tests {
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Default::default(),
+            direct: None,
 
             socket: Some("sock".to_string()),
         };
@@ -767,16 +890,20 @@ mod tests {
         f.as_file().set_len(size).unwrap();
 
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
-            let disk_properties =
-                DiskProperties::new(String::from(f.as_path().to_str().unwrap()), true, engine)
-                    .unwrap();
+            let disk_properties = DiskProperties::new(
+                String::from(f.as_path().to_str().unwrap()),
+                true,
+                engine,
+                false,
+            )
+            .unwrap();
 
             assert_eq!(size, u64::from(SECTOR_SIZE) * num_sectors);
             assert_eq!(disk_properties.nsectors, num_sectors);
             // Testing `backing_file.virtio_block_disk_image_id()` implies
             // duplicating that logic in tests, so skipping it.
 
-            let res = DiskProperties::new("invalid-disk-path".to_string(), true, engine);
+            let res = DiskProperties::new("invalid-disk-path".to_string(), true, engine, false);
             assert!(
                 matches!(res, Err(VirtioBlockError::BackingFile(_, _))),
                 "{:?}",
@@ -821,11 +948,17 @@ mod tests {
             // This will read the number of sectors.
             // The block's backing file size is 0x1000, so there are 8 (4096/512) sectors.
             // The config space is little endian.
-            let expected_config_space = ConfigSpace { capacity: 8 };
+            let expected_config_space = ConfigSpace {
+                capacity: 8,
+                ..Default::default()
+            };
             assert_eq!(actual_config_space, expected_config_space);
 
             // Invalid read.
-            let expected_config_space = ConfigSpace { capacity: 696969 };
+            let expected_config_space = ConfigSpace {
+                capacity: 696969,
+                ..Default::default()
+            };
             actual_config_space = expected_config_space;
             block.read_config(
                 std::mem::size_of::<ConfigSpace>() as u64 + 1,
@@ -842,7 +975,10 @@ mod tests {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             let mut block = default_block(engine);
 
-            let expected_config_space = ConfigSpace { capacity: 696969 };
+            let expected_config_space = ConfigSpace {
+                capacity: 696969,
+                ..Default::default()
+            };
             block.write_config(0, expected_config_space.as_slice());
 
             let mut actual_config_space = ConfigSpace::default();
@@ -852,6 +988,7 @@ mod tests {
             // If privileged user writes to `/dev/mem`, in block config space - byte by byte.
             let expected_config_space = ConfigSpace {
                 capacity: 0x1122334455667788,
+                ..Default::default()
             };
             let expected_config_space_slice = expected_config_space.as_slice();
             for (i, b) in expected_config_space_slice.iter().enumerate() {
@@ -863,6 +1000,7 @@ mod tests {
             // Invalid write.
             let new_config_space = ConfigSpace {
                 capacity: 0xDEADBEEF,
+                ..Default::default()
             };
             block.write_config(5, new_config_space.as_slice());
             // Make sure nothing got written.
@@ -1594,68 +1732,25 @@ mod tests {
 
     #[test]
     fn test_io_engine_throttling() {
-        // FullSQueue BlockError
-        {
+        for count in [16, 17, 47] {
             let mut block = default_block(FileEngineType::Async);
-
             let mem = default_mem();
             let interrupt = default_interrupt();
-            let vq = VirtQueue::new(GuestAddress(0), &mem, IO_URING_NUM_ENTRIES * 4);
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 128);
             block.queues[0] = vq.create_queue();
             block.activate(mem.clone(), interrupt).unwrap();
 
-            // Run scenario that doesn't trigger FullSq BlockError: Add sq_size flush requests.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
+            add_flush_requests_batch(&mut block, &vq, count);
             simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
+            assert_eq!(vq.used.idx.get(), 0);
+
+            // Completion handling admits the next batch without another guest queue kick.
+            for completed in (16..count).step_by(16) {
+                simulate_async_completion_event(&mut block, true);
+                check_flush_requests_batch(completed, &vq);
+            }
             simulate_async_completion_event(&mut block, true);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
-
-            // Run scenario that triggers FullSqError : Add sq_size + 10 flush requests.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES + 10);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(block.is_io_engine_throttled);
-            // When the async_completion_event is triggered:
-            // 1. sq_size requests should be processed processed.
-            // 2. is_io_engine_throttled should be set back to false.
-            // 3. process_queue() should be called again.
-            simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
-            // check that process_queue() was called again resulting in the processing of the
-            // remaining 10 ops.
-            simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES + 10, &vq);
-        }
-
-        // FullCQueue BlockError
-        {
-            let mut block = default_block(FileEngineType::Async);
-
-            let mem = default_mem();
-            let interrupt = default_interrupt();
-            let vq = VirtQueue::new(GuestAddress(0), &mem, IO_URING_NUM_ENTRIES * 4);
-            block.queues[0] = vq.create_queue();
-            block.activate(mem.clone(), interrupt).unwrap();
-
-            // Run scenario that triggers FullCqError. Push 2 * IO_URING_NUM_ENTRIES and wait for
-            // completion. Then try to push another entry.
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
-            thread::sleep(Duration::from_millis(150));
-            add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
-            thread::sleep(Duration::from_millis(150));
-
-            add_flush_requests_batch(&mut block, &vq, 1);
-            simulate_queue_event(&mut block, Some(false));
-            assert!(block.is_io_engine_throttled);
-            simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
-            check_flush_requests_batch(IO_URING_NUM_ENTRIES * 2, &vq);
+            check_flush_requests_batch(count, &vq);
         }
     }
 
@@ -1835,33 +1930,292 @@ mod tests {
     }
 
     #[test]
-    fn test_update_disk_image() {
+    fn test_refresh_size() {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
-            let mut block = default_block(engine);
+            for read_only in [false, true] {
+                let file = TempFile::new().unwrap();
+                file.as_file().set_len(0x1000).unwrap();
+                let path = file.as_path().to_str().unwrap().to_string();
+                let mut block = VirtioBlock::new(VirtioBlockConfig {
+                    drive_id: "scratch".to_string(),
+                    path_on_host: path.clone(),
+                    is_root_device: false,
+                    partuuid: None,
+                    is_read_only: read_only,
+                    cache_type: CacheType::Unsafe,
+                    rate_limiter: None,
+                    file_engine_type: engine,
+                    direct: false,
+                })
+                .unwrap();
+                // Replace the pathname with a different file. Refresh must still use the
+                // original backing object, including when it was opened read-only.
+                std::fs::remove_file(&path).unwrap();
+                File::create(&path).unwrap().set_len(0x20000).unwrap();
+                block.refresh_size().unwrap();
+                let mut capacity = [0; 8];
+                block.read_config(0, &mut capacity);
+                assert_eq!(u64::from_le_bytes(capacity), 8);
+
+                let mem = default_mem();
+                let interrupt = default_interrupt();
+                let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+                set_queue(&mut block, 0, vq.create_queue());
+                block.activate(mem, interrupt.clone()).unwrap();
+                assert!(!interrupt.has_pending_interrupt(VirtioInterruptType::Config));
+
+                // Cover repeated growth, unchanged capacity, partial sectors, and shrink.
+                for (size, expected_sectors) in [(8193, 16), (16384, 32), (16384, 32), (512, 1)] {
+                    file.as_file().set_len(size).unwrap();
+                    block.refresh_size().unwrap();
+                    block.read_config(0, &mut capacity);
+                    assert_eq!(u64::from_le_bytes(capacity), expected_sectors);
+                    assert!(interrupt.has_pending_interrupt(VirtioInterruptType::Config));
+                    interrupt.ack_interrupt(VirtioInterruptType::Config);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_refresh_size_preserves_async_requests() {
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        let mut block = default_block_with_path(
+            file.as_path().to_str().unwrap().to_string(),
+            FileEngineType::Async,
+        );
+        let mem = default_mem();
+        let interrupt = default_interrupt();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem.clone(), interrupt.clone()).unwrap();
+        read_blk_req_descriptors(&vq);
+        let header_addr = GuestAddress(vq.dtable[0].addr.get());
+        let data_addr = GuestAddress(vq.dtable[1].addr.get());
+        let status_addr = GuestAddress(vq.dtable[2].addr.get());
+        vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+        vq.dtable[1].len.set(SECTOR_SIZE);
+        let data = [0x5a; SECTOR_SIZE as usize];
+        mem.write_slice(&data, data_addr).unwrap();
+        mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, header_addr).unwrap();
+
+        // Submit a guest write, then refresh before delivering its completion.
+        simulate_queue_event(&mut block, None);
+        // A rejected replacement must preserve the pending write and original device.
+        assert!(
+            block
+                .update_disk_image("/not/a/drive".to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("refresh-size")
+        );
+        file.as_file().set_len(8192).unwrap();
+        block.refresh_size().unwrap();
+        assert!(interrupt.has_pending_interrupt(VirtioInterruptType::Config));
+        interrupt.ack_interrupt(VirtioInterruptType::Config);
+        simulate_async_completion_event(&mut block, true);
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(
+            u32::from(mem.read_obj::<u8>(status_addr).unwrap()),
+            VIRTIO_BLK_S_OK
+        );
+        interrupt.ack_interrupt(VirtioInterruptType::Queue(0));
+
+        // Write into the newly advertised capacity through the guest's virtqueue.
+        mem.write_obj::<u64>(8, header_addr.unchecked_add(8))
+            .unwrap();
+        mem.write_obj::<u8>(0xff, status_addr).unwrap();
+        vq.avail.ring[1].set(0);
+        vq.avail.idx.set(2);
+        simulate_queue_and_async_completion_events(&mut block, true);
+        assert_eq!(vq.used.idx.get(), 2);
+        assert_eq!(
+            u32::from(mem.read_obj::<u8>(status_addr).unwrap()),
+            VIRTIO_BLK_S_OK
+        );
+        interrupt.ack_interrupt(VirtioInterruptType::Queue(0));
+
+        // The guest can read back both the original write and the new-capacity write.
+        for (index, sector) in [(2, 0), (3, 8)] {
+            mem.write_obj::<u32>(VIRTIO_BLK_T_IN, header_addr).unwrap();
+            mem.write_obj::<u64>(sector, header_addr.unchecked_add(8))
+                .unwrap();
+            mem.write_slice(&[0; SECTOR_SIZE as usize], data_addr)
+                .unwrap();
+            mem.write_obj::<u8>(0xff, status_addr).unwrap();
+            vq.dtable[1]
+                .flags
+                .set(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
+            vq.avail.ring[index as usize].set(0);
+            vq.avail.idx.set(index + 1);
+            simulate_queue_and_async_completion_events(&mut block, true);
+            assert_eq!(vq.used.idx.get(), index + 1);
+            assert_eq!(
+                u32::from(mem.read_obj::<u8>(status_addr).unwrap()),
+                VIRTIO_BLK_S_OK
+            );
+            let mut actual = [0; SECTOR_SIZE as usize];
+            mem.read_slice(&mut actual, data_addr).unwrap();
+            assert_eq!(actual, data);
+            interrupt.ack_interrupt(VirtioInterruptType::Queue(0));
+        }
+    }
+
+    #[test]
+    fn test_update_disk_image() {
+        let mut block = default_block(FileEngineType::Sync);
+        let mem = default_mem();
+        let interrupt = default_interrupt();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem, interrupt.clone()).unwrap();
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len(8192).unwrap();
+
+        block
+            .update_disk_image(file.as_path().to_str().unwrap().to_string())
+            .unwrap();
+
+        let mut capacity = [0; 8];
+        block.read_config(0, &mut capacity);
+        assert_eq!(u64::from_le_bytes(capacity), 16);
+        assert!(interrupt.has_pending_interrupt(VirtioInterruptType::Config));
+    }
+
+    /// Opens a direct I/O drive, or returns `None` if the test filesystem lacks `O_DIRECT`.
+    fn direct_block(file: &TempFile, engine: FileEngineType) -> Option<VirtioBlock> {
+        let res = VirtioBlock::new(VirtioBlockConfig {
+            drive_id: "direct".to_string(),
+            path_on_host: file.as_path().to_str().unwrap().to_string(),
+            is_root_device: false,
+            partuuid: None,
+            is_read_only: false,
+            cache_type: CacheType::Writeback,
+            rate_limiter: None,
+            file_engine_type: engine,
+            direct: true,
+        });
+        match res {
+            Err(VirtioBlockError::BackingFile(err, _))
+                if err.raw_os_error() == Some(libc::EINVAL) =>
+            {
+                eprintln!("skipping: the test filesystem does not support O_DIRECT");
+                None
+            }
+            res => Some(res.unwrap()),
+        }
+    }
+
+    #[test]
+    fn test_direct_io_config() {
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let file = TempFile::new().unwrap();
+            // The partial trailing block is not exposed to the guest.
+            file.as_file().set_len(0x2000 + 512).unwrap();
+            let Some(mut block) = direct_block(&file, engine) else {
+                return;
+            };
+            assert_eq!(block.disk.direct_align, Some(DIRECT_IO_FILE_ALIGN));
+            assert_ne!(block.avail_features & (1u64 << VIRTIO_BLK_F_BLK_SIZE), 0);
+
+            let mut config = ConfigSpace::default();
+            block.read_config(0, config.as_mut_slice());
+            assert_eq!(u64::from_le(config.capacity), 16);
+            assert_eq!(u32::from_le(config.blk_size), DIRECT_IO_FILE_ALIGN);
+            assert!(block.config().direct);
+            assert_eq!(BlockDeviceConfig::from(block.config()).direct, Some(true));
+
+            // Refreshed capacity also covers whole blocks only.
+            file.as_file().set_len(0x3000 + 100).unwrap();
+            block.refresh_size().unwrap();
+            block.read_config(0, config.as_mut_slice());
+            assert_eq!(u64::from_le(config.capacity), 24);
+
+            // The block size advertised to the guest cannot change with a new backing file.
+            let other = TempFile::new().unwrap();
+            let err = block
+                .update_disk_image(other.as_path().to_str().unwrap().to_string())
+                .unwrap_err();
+            match engine {
+                FileEngineType::Sync => {
+                    assert!(matches!(err, VirtioBlockError::DirectBackingFileUpdate))
+                }
+                FileEngineType::Async => {
+                    assert!(matches!(err, VirtioBlockError::AsyncBackingFileUpdate))
+                }
+            }
+        }
+
+        // Drives without direct I/O do not advertise a block size.
+        let block = default_block(FileEngineType::Sync);
+        assert_eq!(block.disk.direct_align, None);
+        assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_BLK_SIZE), 0);
+        assert_eq!(block.config_space.blk_size, 0);
+        assert!(!block.config().direct);
+        assert_eq!(BlockDeviceConfig::from(block.config()).direct, None);
+    }
+
+    #[test]
+    fn test_direct_io_requests() {
+        use std::os::unix::fs::FileExt;
+
+        const BLOCK: u32 = DIRECT_IO_FILE_ALIGN;
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let file = TempFile::new().unwrap();
+            file.as_file().set_len(0x4000).unwrap();
+            let Some(mut block) = direct_block(&file, engine) else {
+                return;
+            };
             let mem = default_mem();
             let interrupt = default_interrupt();
             let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
             set_queue(&mut block, 0, vq.create_queue());
-            block.activate(mem, interrupt).unwrap();
-            let f = TempFile::new().unwrap();
-            let path = f.as_path();
-            let mdata = metadata(path).unwrap();
-            let mut id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
-            let str_id = format!("{}{}{}", mdata.st_dev(), mdata.st_rdev(), mdata.st_ino());
-            let part_id = str_id.as_bytes();
-            id[..cmp::min(part_id.len(), VIRTIO_BLK_ID_BYTES as usize)].clone_from_slice(
-                &part_id[..cmp::min(part_id.len(), VIRTIO_BLK_ID_BYTES as usize)],
-            );
+            block.activate(mem.clone(), interrupt.clone()).unwrap();
+            read_blk_req_descriptors(&vq);
+            let header_addr = GuestAddress(vq.dtable[0].addr.get());
+            let status_addr = GuestAddress(vq.dtable[2].addr.get());
+            let written = [0xa5u8; BLOCK as usize];
 
-            block
-                .update_disk_image(String::from(path.to_str().unwrap()))
-                .unwrap();
+            // (data address, sector, length, expected status)
+            let requests = [
+                // Aligned guest buffer, written in place.
+                (0x2000, 0, BLOCK, VIRTIO_BLK_S_OK),
+                // Unaligned guest buffer, written through a bounce buffer.
+                (0x5200, 8, BLOCK, VIRTIO_BLK_S_OK),
+                // Partial blocks and unaligned offsets fail without reaching the file.
+                (0x2000, 16, 512, VIRTIO_BLK_S_IOERR),
+                (0x2000, 17, BLOCK, VIRTIO_BLK_S_IOERR),
+            ];
+            for (idx, (data_addr, sector, len, status)) in requests.into_iter().enumerate() {
+                vq.dtable[1].addr.set(data_addr);
+                vq.dtable[1].len.set(len);
+                vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+                mem.write_slice(&written[..len as usize], GuestAddress(data_addr))
+                    .unwrap();
+                mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, header_addr).unwrap();
+                mem.write_obj::<u64>(sector, header_addr.unchecked_add(8))
+                    .unwrap();
+                mem.write_obj::<u8>(0xff, status_addr).unwrap();
+                let idx = u16::try_from(idx).unwrap();
+                vq.avail.ring[usize::from(idx)].set(0);
+                vq.avail.idx.set(idx + 1);
 
-            assert_eq!(
-                block.disk.file_engine.file().metadata().unwrap().st_ino(),
-                mdata.st_ino()
-            );
-            assert_eq!(block.disk.image_id, id.as_slice());
+                simulate_queue_and_async_completion_events(&mut block, true);
+                assert_eq!(vq.used.idx.get(), idx + 1);
+                assert_eq!(
+                    u32::from(mem.read_obj::<u8>(status_addr).unwrap()),
+                    status,
+                    "request {idx}"
+                );
+                interrupt.ack_interrupt(VirtioInterruptType::Queue(0));
+            }
+
+            // Only the two successful writes reached the file.
+            let mut contents = vec![0u8; 0x4000];
+            file.as_file().read_exact_at(&mut contents, 0).unwrap();
+            assert!(contents[..0x2000].iter().all(|&b| b == 0xa5));
+            assert!(contents[0x2000..].iter().all(|&b| b == 0));
         }
     }
 }

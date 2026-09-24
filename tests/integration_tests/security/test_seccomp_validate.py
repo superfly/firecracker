@@ -88,6 +88,36 @@ class BpfMapReader:
         return threads
 
 
+def test_runtime_io_uring_policy(seccompiler, bin_test_syscall, tmp_path):
+    """Runtime threads cannot create rings or mutate their registered resources."""
+    policy_path = Path(f"../resources/seccomp/{ARCH}-unknown-linux-musl.json")
+    policy = json.loads(policy_path.read_text(encoding="ascii"))
+    filters = BpfMapReader.from_file(seccompiler.compile(policy)).split()
+    arch = seccomp.Arch.X86_64 if ARCH == "x86_64" else seccomp.Arch.AARCH64
+    # Avoid core dumps from the intentionally trapped syscalls.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    for thread, program in filters.items():
+        filter_path = tmp_path / f"{thread}.bpf"
+        filter_path.write_bytes(program)
+        for syscall, args in [
+            ("io_uring_setup", [8, 0]),
+            ("io_uring_register", [-1, 2]),  # IORING_REGISTER_FILES
+            ("io_uring_register", [-1, 6]),  # IORING_REGISTER_FILES_UPDATE
+            ("io_uring_register", [-1, 14]),  # IORING_REGISTER_FILES_UPDATE2
+            ("io_uring_enter", [-1, 0, 0, 0]),
+        ]:
+            syscall_id = seccomp.resolve_syscall(arch, syscall)
+            result = utils.run_cmd(
+                [str(bin_test_syscall), str(filter_path), str(syscall_id)]
+                + [str(arg) for arg in args],
+                shell=False,
+            )
+            # The helper ignores syscall errno, so zero means seccomp allowed the call.
+            # Only the VMM may submit/wait on rings created during device setup.
+            expected = 0 if (thread == "vmm" and syscall == "io_uring_enter") else -31
+            assert result.returncode == expected, (thread, syscall, args, result)
+
+
 def test_validate_filter(seccompiler, bin_test_syscall, monkeypatch, tmp_path):
     """Assert that the seccomp filter matches the JSON description."""
 

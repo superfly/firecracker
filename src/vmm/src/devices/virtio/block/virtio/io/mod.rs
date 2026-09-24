@@ -48,6 +48,70 @@ pub struct RequestError<E> {
     pub error: E,
 }
 
+/// Largest request copied through an aligned buffer when its guest buffer is not aligned for
+/// direct I/O. Larger unaligned requests fail rather than allocate host memory for the guest.
+pub const MAX_DIRECT_IO_BOUNCE_LEN: u32 = 1 << 20;
+
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum DirectIoError {
+    /// Offset {0} and length {1} must be multiples of the {2}-byte direct I/O block size
+    Unaligned(u64, u32, u32),
+    /// Unaligned guest buffer of {0} bytes exceeds the {1}-byte bounce buffer limit
+    BounceTooLarge(u32, u32),
+}
+
+/// Heap buffer whose contents start at an address aligned for direct I/O.
+#[derive(Debug)]
+pub struct AlignedBuf {
+    buf: Vec<u8>,
+    start: usize,
+    len: usize,
+}
+
+impl AlignedBuf {
+    fn new(len: u32, align: u32) -> Self {
+        let (len, align) = (len as usize, align as usize);
+        let buf = vec![0; len + align];
+        // The allocation does not move with the Vec, so the aligned start stays valid.
+        let addr = buf.as_ptr() as usize;
+        let start = addr.next_multiple_of(align) - addr;
+        Self { buf, start, len }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..self.start + self.len]
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[self.start..self.start + self.len]
+    }
+}
+
+/// Checks a direct I/O request against the backing file's `align`ment.
+///
+/// Offsets and lengths must already be aligned. A guest buffer at an unaligned `host_addr` is
+/// served through the returned bounce buffer; `None` means the guest buffer can be used in place.
+pub fn direct_io_bounce(
+    align: u32,
+    offset: u64,
+    host_addr: usize,
+    count: u32,
+) -> Result<Option<AlignedBuf>, DirectIoError> {
+    if offset % u64::from(align) != 0 || count % align != 0 {
+        return Err(DirectIoError::Unaligned(offset, count, align));
+    }
+    if host_addr % align as usize == 0 {
+        return Ok(None);
+    }
+    if count > MAX_DIRECT_IO_BOUNCE_LEN {
+        return Err(DirectIoError::BounceTooLarge(
+            count,
+            MAX_DIRECT_IO_BOUNCE_LEN,
+        ));
+    }
+    Ok(Some(AlignedBuf::new(count, align)))
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum FileEngine {
@@ -57,25 +121,24 @@ pub enum FileEngine {
 }
 
 impl FileEngine {
-    pub fn from_file(file: File, engine_type: FileEngineType) -> Result<FileEngine, BlockIoError> {
+    /// Creates an engine for `file`. `direct_align` is set when the file was opened with
+    /// `O_DIRECT`, and gives the alignment its offsets, lengths and buffers require.
+    pub fn from_file(
+        file: File,
+        engine_type: FileEngineType,
+        direct_align: Option<u32>,
+    ) -> Result<FileEngine, BlockIoError> {
         match engine_type {
             FileEngineType::Async => Ok(FileEngine::Async(
-                AsyncFileEngine::from_file(file).map_err(BlockIoError::Async)?,
+                AsyncFileEngine::from_file(file, direct_align).map_err(BlockIoError::Async)?,
             )),
-            FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
+            FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(
+                file,
+                direct_align,
+            ))),
         }
     }
 
-    pub fn update_file_path(&mut self, file: File) -> Result<(), BlockIoError> {
-        match self {
-            FileEngine::Async(engine) => engine.update_file(file).map_err(BlockIoError::Async)?,
-            FileEngine::Sync(engine) => engine.update_file(file),
-        };
-
-        Ok(())
-    }
-
-    #[cfg(test)]
     pub fn file(&self) -> &File {
         match self {
             FileEngine::Async(engine) => engine.file(),
@@ -255,7 +318,7 @@ pub mod tests {
         let mem = create_mem();
         // Create backing file.
         let file = TempFile::new().unwrap().into_file();
-        let mut engine = FileEngine::from_file(file, FileEngineType::Sync).unwrap();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Sync, None).unwrap();
 
         let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
             .as_bytes()
@@ -339,7 +402,7 @@ pub mod tests {
     fn test_async() {
         // Create backing file.
         let file = TempFile::new().unwrap().into_file();
-        let mut engine = FileEngine::from_file(file, FileEngineType::Async).unwrap();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Async, None).unwrap();
 
         let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
             .as_bytes()
@@ -391,5 +454,127 @@ pub mod tests {
 
         engine.drain(true).unwrap();
         engine.drain_and_flush(true).unwrap();
+    }
+
+    #[test]
+    fn test_direct_io_bounce() {
+        // Aligned offset, length and buffer are used in place.
+        assert!(
+            direct_io_bounce(4096, 8192, 0x10000, 4096)
+                .unwrap()
+                .is_none()
+        );
+
+        // Offsets and lengths must be block multiples.
+        for (offset, count) in [(512, 4096), (4096, 512), (4096, 0x1200)] {
+            assert!(matches!(
+                direct_io_bounce(4096, offset, 0x10000, count),
+                Err(DirectIoError::Unaligned(o, c, 4096)) if o == offset && c == count
+            ));
+        }
+
+        // An unaligned buffer gets an aligned bounce buffer of the request's length.
+        let buf = direct_io_bounce(4096, 0, 0x10200, 8192).unwrap().unwrap();
+        assert_eq!(buf.as_slice().len(), 8192);
+        assert_eq!(buf.as_slice().as_ptr() as usize % 4096, 0);
+
+        // Bounce buffers are bounded.
+        let too_large = MAX_DIRECT_IO_BOUNCE_LEN + 4096;
+        assert!(matches!(
+            direct_io_bounce(4096, 0, 0x10200, too_large),
+            Err(DirectIoError::BounceTooLarge(c, MAX_DIRECT_IO_BOUNCE_LEN)) if c == too_large
+        ));
+        assert!(
+            direct_io_bounce(4096, 0, 0x10000, too_large)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_direct_io_engines() {
+        const BLOCK: u32 = 4096;
+        let data = vmm_sys_util::rand::rand_alphanumerics(BLOCK as usize)
+            .as_bytes()
+            .to_vec();
+        // Guest memory is page aligned, so these addresses are aligned and unaligned for 4 KiB.
+        let aligned = GuestAddress(0);
+        let unaligned_write = GuestAddress(512);
+        let unaligned_read = GuestAddress(1024);
+
+        for engine_type in [FileEngineType::Sync, FileEngineType::Async] {
+            let file = TempFile::new().unwrap().into_file();
+            file.set_len(2 * u64::from(BLOCK)).unwrap();
+            let mut engine = FileEngine::from_file(file, engine_type, Some(BLOCK)).unwrap();
+
+            let run =
+                |engine: &mut FileEngine,
+                 mem: &GuestMemoryMmap,
+                 res: Result<FileEngineOk, RequestError<BlockIoError>>| {
+                    match engine_type {
+                        FileEngineType::Sync => assert_sync_execution!(res, BLOCK),
+                        FileEngineType::Async => {
+                            assert_queued!(res);
+                            assert_async_execution(mem, engine, BLOCK);
+                        }
+                    }
+                };
+
+            // Write from an unaligned guest buffer, through a bounce buffer.
+            let mem = create_mem();
+            mem.write(&data, unaligned_write).unwrap();
+            let res = engine.write(
+                u64::from(BLOCK),
+                &mem,
+                unaligned_write,
+                BLOCK,
+                PendingRequest::default(),
+            );
+            run(&mut engine, &mem, res);
+
+            // Read into an unaligned guest buffer, through a bounce buffer.
+            let mem = create_mem();
+            let res = engine.read(
+                u64::from(BLOCK),
+                &mem,
+                unaligned_read,
+                BLOCK,
+                PendingRequest::default(),
+            );
+            run(&mut engine, &mem, res);
+            let mut buf = vec![0u8; BLOCK as usize];
+            mem.read_slice(&mut buf, unaligned_read).unwrap();
+            assert_eq!(buf, data);
+            check_dirty_mem(&mem, unaligned_read, BLOCK);
+
+            // Read into an aligned guest buffer, in place.
+            let mem = create_mem();
+            let res = engine.read(
+                u64::from(BLOCK),
+                &mem,
+                aligned,
+                BLOCK,
+                PendingRequest::default(),
+            );
+            run(&mut engine, &mem, res);
+            mem.read_slice(&mut buf, aligned).unwrap();
+            assert_eq!(buf, data);
+
+            // Unaligned offsets and lengths are rejected without touching the file.
+            for (offset, count) in [(512, BLOCK), (0, 512)] {
+                let res = engine.write(offset, &mem, aligned, count, PendingRequest::default());
+                let err = res.map(|_| ()).unwrap_err().error;
+                assert!(
+                    matches!(
+                        err,
+                        BlockIoError::Sync(SyncIoError::DirectIo(DirectIoError::Unaligned(..)))
+                            | BlockIoError::Async(AsyncIoError::DirectIo(
+                                DirectIoError::Unaligned(..)
+                            ))
+                    ),
+                    "{err:?}"
+                );
+            }
+        }
     }
 }
