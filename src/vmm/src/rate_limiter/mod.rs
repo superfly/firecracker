@@ -236,6 +236,24 @@ impl TokenBucket {
         self.budget = std::cmp::min(self.budget.saturating_add(tokens), self.size);
     }
 
+    /// Returns how long until the budget covers `tokens`, assuming no other consumption.
+    ///
+    /// Meant to be called right after `reduce()` failed, when the budget has just been
+    /// replenished up to `last_update`.
+    fn refill_delay(&self, tokens: u64) -> Duration {
+        let deficit = u128::from(tokens.saturating_sub(self.budget));
+        if deficit == 0 {
+            return Duration::ZERO;
+        }
+        let processed_capacity = u128::from(self.processed_capacity);
+        let processed_refill_time = u128::from(self.processed_refill_time);
+        // Round up so the timer never fires before the tokens are available.
+        let needed_ns = (deficit * processed_refill_time).div_ceil(processed_capacity);
+        // `auto_replenish()` carries sub-token time in `last_update`; it counts towards the wait.
+        let needed_ns = needed_ns.saturating_sub(self.last_update.elapsed().as_nanos());
+        Duration::from_nanos(u64::try_from(needed_ns).unwrap_or(u64::MAX))
+    }
+
     /// Returns the capacity of the token bucket.
     pub fn capacity(&self) -> u64 {
         self.size
@@ -304,6 +322,9 @@ pub struct RateLimiter {
     timer_fd: TimerFd,
     // Internal flag that quickly determines timer state.
     timer_active: bool,
+    // When set, a depleted bucket arms the timer for the time its tokens take to refill,
+    // bounded below by this value. When unset, the timer always waits the fixed interval.
+    min_refill_delay: Option<Duration>,
 }
 
 impl PartialEq for RateLimiter {
@@ -374,7 +395,21 @@ impl RateLimiter {
             ops: ops_token_bucket,
             timer_fd,
             timer_active: false,
+            min_refill_delay: None,
         })
+    }
+
+    /// Arms the refill timer for the time a depleted bucket needs to cover the failed request,
+    /// but no less than `min_delay` and no more than the fixed refill interval.
+    ///
+    /// Without this, the limiter always waits the fixed refill interval once a bucket is empty.
+    pub fn set_min_refill_delay(&mut self, min_delay: Duration) {
+        self.min_refill_delay = Some(min_delay);
+    }
+
+    /// Returns the minimum refill delay, if adaptive refill timing is enabled.
+    pub fn min_refill_delay(&self) -> Option<Duration> {
+        self.min_refill_delay
     }
 
     // Arm the timer of the rate limiter with the provided `TimerState`.
@@ -407,7 +442,16 @@ impl RateLimiter {
                 // make sure there is only one running timer for this limiter.
                 BucketReduction::Failure => {
                     if !self.timer_active {
-                        self.activate_timer(TIMER_REFILL_STATE);
+                        let timer_state = match self.min_refill_delay {
+                            Some(min_delay) => TimerState::Oneshot(
+                                bucket
+                                    .refill_delay(tokens)
+                                    .max(min_delay)
+                                    .min(Duration::from_millis(REFILL_TIMER_INTERVAL_MS)),
+                            ),
+                            None => TIMER_REFILL_STATE,
+                        };
+                        self.activate_timer(timer_state);
                     }
                     false
                 }
@@ -994,6 +1038,104 @@ pub(crate) mod tests {
             let bytes_tb = l.get_token_bucket(TokenType::Ops).unwrap();
             assert_eq!(bytes_tb.budget(), 900);
         }
+    }
+
+    #[test]
+    fn test_token_bucket_refill_delay() {
+        // 1 token per millisecond.
+        let mut tb = TokenBucket::new(1000, 0, 1000).unwrap();
+        assert_eq!(tb.refill_delay(1000), Duration::ZERO);
+
+        assert_eq!(tb.reduce(1000), BucketReduction::Success);
+        tb.last_update = Instant::now();
+        let delay = tb.refill_delay(10);
+        assert!(delay <= Duration::from_millis(10), "{delay:?}");
+        assert!(delay > Duration::from_millis(9), "{delay:?}");
+
+        // Time already accrued towards the next tokens shortens the wait.
+        tb.last_update = Instant::now() - Duration::from_millis(4);
+        let delay = tb.refill_delay(10);
+        assert!(delay <= Duration::from_millis(6), "{delay:?}");
+        assert!(delay > Duration::from_millis(5), "{delay:?}");
+
+        // Only the deficit over the current budget needs to refill.
+        tb.force_replenish(8);
+        tb.last_update = Instant::now();
+        let delay = tb.refill_delay(10);
+        assert!(delay <= Duration::from_millis(2), "{delay:?}");
+        assert!(delay > Duration::from_millis(1), "{delay:?}");
+
+        // Rounds up to the nanosecond the token becomes available: 3 tokens per millisecond.
+        let mut tb = TokenBucket::new(3, 0, 1).unwrap();
+        assert_eq!(tb.reduce(3), BucketReduction::Success);
+        // A future `last_update` means no time has accrued yet.
+        tb.last_update = Instant::now() + Duration::from_secs(1);
+        assert_eq!(tb.refill_delay(1), Duration::from_nanos(333_334));
+    }
+
+    fn armed_delay(l: &RateLimiter) -> Duration {
+        match l.timer_fd.get_state() {
+            TimerState::Oneshot(delay) => delay,
+            state => panic!("expected an armed oneshot timer, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_adaptive_refill_timer() {
+        let min_delay = Duration::from_millis(5);
+        let max_delay = Duration::from_millis(REFILL_TIMER_INTERVAL_MS);
+
+        // Bandwidth of 1 byte per millisecond: 20 missing bytes refill in 20ms.
+        let mut l = RateLimiter::new(1000, 0, 1000, 0, 0, 0).unwrap();
+        assert_eq!(l.min_refill_delay(), None);
+        l.set_min_refill_delay(min_delay);
+        assert_eq!(l.min_refill_delay(), Some(min_delay));
+        assert!(l.consume(1000, TokenType::Bytes));
+        assert!(!l.consume(20, TokenType::Bytes));
+        assert!(l.is_blocked());
+        let delay = armed_delay(&l);
+        assert!(delay <= Duration::from_millis(20), "{delay:?}");
+        assert!(delay > Duration::from_millis(15), "{delay:?}");
+        // The limiter unblocks once those tokens are available, well before 100ms.
+        thread::sleep(Duration::from_millis(30));
+        l.event_handler().unwrap();
+        assert!(!l.is_blocked());
+        assert!(l.consume(20, TokenType::Bytes));
+
+        // A tiny deficit still waits for the minimum delay.
+        let mut l = RateLimiter::new(1000, 0, 1000, 0, 0, 0).unwrap();
+        l.set_min_refill_delay(min_delay);
+        assert!(l.consume(1000, TokenType::Bytes));
+        assert!(!l.consume(1, TokenType::Bytes));
+        let delay = armed_delay(&l);
+        assert!(delay <= min_delay, "{delay:?}");
+        assert!(delay > min_delay - Duration::from_millis(2), "{delay:?}");
+
+        // A large deficit waits no longer than the fixed refill interval.
+        let mut l = RateLimiter::new(1000, 0, 1000, 0, 0, 0).unwrap();
+        l.set_min_refill_delay(min_delay);
+        assert!(l.consume(1000, TokenType::Bytes));
+        assert!(!l.consume(500, TokenType::Bytes));
+        let delay = armed_delay(&l);
+        assert!(delay <= max_delay, "{delay:?}");
+        assert!(delay > max_delay - Duration::from_millis(5), "{delay:?}");
+
+        // The ops bucket arms the timer from its own refill rate.
+        let mut l = RateLimiter::new(0, 0, 0, 1000, 0, 1000).unwrap();
+        l.set_min_refill_delay(min_delay);
+        assert!(l.consume(1000, TokenType::Ops));
+        assert!(!l.consume(20, TokenType::Ops));
+        let delay = armed_delay(&l);
+        assert!(delay <= Duration::from_millis(20), "{delay:?}");
+        assert!(delay > Duration::from_millis(15), "{delay:?}");
+
+        // Without a minimum refill delay, the fixed interval is kept.
+        let mut l = RateLimiter::new(1000, 0, 1000, 0, 0, 0).unwrap();
+        assert!(l.consume(1000, TokenType::Bytes));
+        assert!(!l.consume(1, TokenType::Bytes));
+        let delay = armed_delay(&l);
+        assert!(delay <= max_delay, "{delay:?}");
+        assert!(delay > max_delay - Duration::from_millis(5), "{delay:?}");
     }
 
     #[test]
