@@ -10,6 +10,9 @@ pub mod metrics;
 pub mod persist;
 pub mod request;
 pub mod test_utils;
+mod threaded;
+
+pub use self::io::threaded_io::set_worker_seccomp_filter;
 
 use vm_memory::GuestMemoryError;
 
@@ -29,6 +32,9 @@ pub const BLOCK_QUEUE_SIZES: [u16; BLOCK_NUM_QUEUES] = [FIRECRACKER_MAX_QUEUE_SI
 // So we can use 128 IO_URING entries without ever triggering a FullSq Error.
 /// Maximum number of io uring entries we allow in the queue.
 pub const IO_URING_NUM_ENTRIES: u16 = 128;
+/// Minimum wait before retrying a depleted rate limiter. The limiter otherwise waits
+/// until the failed request's tokens have refilled, rather than a fixed 100ms.
+pub const RATE_LIMITER_MIN_REFILL_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Errors the block device can trigger.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]

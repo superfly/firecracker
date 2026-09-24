@@ -21,7 +21,10 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::io::async_io;
 use super::request::*;
-use super::{BLOCK_QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError, io as block_io};
+use super::{
+    BLOCK_QUEUE_SIZES, RATE_LIMITER_MIN_REFILL_DELAY, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError,
+    io as block_io,
+};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMetricsPerDevice};
@@ -50,6 +53,8 @@ pub enum FileEngineType {
     /// Use a Sync engine, based on blocking system calls.
     #[default]
     Sync,
+    /// Use a Threaded engine: blocking system calls, made from a worker thread per drive.
+    Threaded,
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
@@ -272,7 +277,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
+            _ => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -291,12 +296,13 @@ impl VirtioBlock {
             config.file_engine_type,
         )?;
 
-        let rate_limiter = config
+        let mut rate_limiter: RateLimiter = config
             .rate_limiter
             .map(RateLimiterConfig::try_into)
             .transpose()
             .map_err(VirtioBlockError::RateLimiter)?
             .unwrap_or_default();
+        rate_limiter.set_min_refill_delay(RATE_LIMITER_MIN_REFILL_DELAY);
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -560,6 +566,7 @@ impl VirtioBlock {
         match self.disk.file_engine {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
+            FileEngine::Threaded(_) => FileEngineType::Threaded,
         }
     }
 
@@ -579,6 +586,7 @@ impl VirtioBlock {
         if let FileEngine::Async(ref _engine) = self.disk.file_engine {
             self.process_async_completion_queue();
         }
+        self.process_threaded_completion_queue();
     }
 }
 

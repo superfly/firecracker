@@ -30,6 +30,8 @@ pub enum FileEngineTypeState {
     Sync,
     /// Async File Engine.
     Async,
+    /// Threaded File Engine.
+    Threaded,
 }
 
 impl From<FileEngineType> for FileEngineTypeState {
@@ -37,6 +39,7 @@ impl From<FileEngineType> for FileEngineTypeState {
         match file_engine_type {
             FileEngineType::Sync => FileEngineTypeState::Sync,
             FileEngineType::Async => FileEngineTypeState::Async,
+            FileEngineType::Threaded => FileEngineTypeState::Threaded,
         }
     }
 }
@@ -46,6 +49,7 @@ impl From<FileEngineTypeState> for FileEngineType {
         match file_engine_type_state {
             FileEngineTypeState::Sync => FileEngineType::Sync,
             FileEngineTypeState::Async => FileEngineType::Async,
+            FileEngineTypeState::Threaded => FileEngineType::Threaded,
         }
     }
 }
@@ -87,8 +91,9 @@ impl Persist<'_> for VirtioBlock {
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
-        let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
+        let mut rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
             .map_err(VirtioBlockError::RateLimiter)?;
+        rate_limiter.set_min_refill_delay(RATE_LIMITER_MIN_REFILL_DELAY);
 
         let disk_properties = DiskProperties::new(
             state.disk_path.clone(),
@@ -239,5 +244,14 @@ mod tests {
 
         // Test that block specific fields are the same.
         assert_eq!(restored_block.disk.file_path, block.disk.file_path);
+        // The adaptive refill delay is device policy and must be reapplied on restore.
+        assert_eq!(
+            block.rate_limiter.min_refill_delay(),
+            Some(RATE_LIMITER_MIN_REFILL_DELAY)
+        );
+        assert_eq!(
+            restored_block.rate_limiter.min_refill_delay(),
+            Some(RATE_LIMITER_MIN_REFILL_DELAY)
+        );
     }
 }

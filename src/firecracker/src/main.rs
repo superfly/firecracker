@@ -363,6 +363,14 @@ fn main_exec() -> Result<(), MainError> {
     .and_then(seccomp::get_filters)
     .map_err(MainError::SeccompFilter)?;
 
+    // Threaded block IO engine workers install their own filter.
+    if let Some(filter) = seccomp_filters
+        .get("block_io")
+        .or_else(|| seccomp_filters.get("vmm"))
+    {
+        vmm::devices::virtio::block::virtio::set_worker_seccomp_filter(filter.clone());
+    }
+
     let vmm_config_json = arguments
         .single_value("config-file")
         .map(fs::read_to_string)
