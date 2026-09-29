@@ -23,6 +23,7 @@ def partuuid_and_disk_path_tmpfs(rootfs, tmp_path):
     disk_path.unlink()
 
 
+@pytest.mark.parametrize("io_engine", ["Sync", "Async", "Threaded"], indirect=True)
 def test_rescan_file(uvm_plain_any, io_engine):
     """
     Verify that rescan works with a file-backed virtio device.

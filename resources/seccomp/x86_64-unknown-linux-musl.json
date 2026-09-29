@@ -147,6 +147,19 @@
                 ]
             },
             {
+                "syscall": "fcntl",
+                "comment": "Used to duplicate the backing file when updating a Threaded drive",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1030,
+                        "comment": "FCNTL_F_DUPFD_CLOEXEC"
+                    }
+                ]
+            },
+            {
                 "syscall": "futex",
                 "comment": "Used for synchronization (during thread teardown when joining multiple vcpu threads at once)",
                 "args": [
