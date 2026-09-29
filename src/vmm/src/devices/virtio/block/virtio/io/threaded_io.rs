@@ -51,6 +51,11 @@ pub const THREADED_SEG_MAX: u32 = 32;
 /// loop serves nothing else, so it has to stay far below what any other device would notice.
 pub const POLL_BUDGET: Duration = Duration::from_micros(100);
 
+/// How many requests may be in flight for the submitter to wait for them. Waiting pays when a
+/// guest sends a request and does nothing until it completes. With more in flight, completions
+/// are handled in bursts anyway, and the wait would only take time from the event loop.
+pub const POLL_MAX_IN_FLIGHT: usize = 2;
+
 /// A guest buffer: its address and length.
 pub type Segment = (GuestAddress, u32);
 
@@ -582,13 +587,17 @@ impl ThreadedFileEngine {
     }
 
     /// Hand the requests pushed since the last kick to the worker, then wait for the completions
-    /// of everything in flight, for up to the poll budget, and only while the backing file has
-    /// been answering within it. Returns whether there are completions to pop.
+    /// of everything in flight, for up to the poll budget. Only while the backing file has been
+    /// answering within it, and with no more than [`POLL_MAX_IN_FLIGHT`] requests to wait for.
+    /// Returns whether there are completions to pop.
     ///
     /// The worker does not signal the completions it finishes meanwhile.
     pub fn kick_and_poll(&mut self) -> Result<bool, ThreadedIoError> {
+        let waiting_for = self.in_flight - self.ready.len();
         let budget = match self.poll_budget {
-            Some(budget) if self.poll_pays && self.in_flight > self.ready.len() => budget,
+            Some(budget) if self.poll_pays && (1..=POLL_MAX_IN_FLIGHT).contains(&waiting_for) => {
+                budget
+            }
             _ => {
                 self.kick()?;
                 return Ok(!self.ready.is_empty());
@@ -914,13 +923,24 @@ mod tests {
 
         // With time to wait, everything in flight completes in the call, unsignalled.
         engine.set_poll_budget(Some(Duration::from_secs(10)));
-        push(&mut engine, 4);
+        push(&mut engine, POLL_MAX_IN_FLIGHT);
         assert!(engine.kick_and_poll().unwrap());
         engine.completion_evt().read().unwrap_err();
-        for _ in 0..4 {
+        for _ in 0..POLL_MAX_IN_FLIGHT {
             assert_eq!(engine.pop().unwrap().result.unwrap(), FILE_LEN);
         }
         assert!(engine.pop().is_none());
+
+        // With more in flight than that, completions are signalled, and polling stays on.
+        push(&mut engine, POLL_MAX_IN_FLIGHT + 1);
+        assert!(!engine.kick_and_poll().unwrap());
+        assert!(engine.poll_pays);
+        engine.drain(false).unwrap();
+        wait_for_signal(&engine);
+        for _ in 0..=POLL_MAX_IN_FLIGHT {
+            assert_eq!(engine.pop().unwrap().result.unwrap(), FILE_LEN);
+        }
+        assert!(engine.poll_pays);
         // Nothing in flight, nothing to wait for.
         assert!(!engine.kick_and_poll().unwrap());
 
