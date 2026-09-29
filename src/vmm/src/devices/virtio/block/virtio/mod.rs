@@ -10,6 +10,9 @@ pub mod metrics;
 pub mod persist;
 pub mod request;
 pub mod test_utils;
+mod threaded;
+
+pub use self::io::threaded_io::set_worker_seccomp_filter;
 
 use vm_memory::GuestMemoryError;
 

@@ -236,8 +236,8 @@ pub struct Request {
     pub r#type: RequestType,
     pub data_len: u32,
     pub status_addr: GuestAddress,
-    sector: u64,
-    data_addr: GuestAddress,
+    pub(super) sector: u64,
+    pub(super) data_addr: GuestAddress,
 }
 
 impl Request {
@@ -354,7 +354,7 @@ impl Request {
         self.sector << SECTOR_SHIFT
     }
 
-    fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
+    pub(super) fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
         PendingRequest {
             r#type: self.r#type,
             data_len: self.data_len,

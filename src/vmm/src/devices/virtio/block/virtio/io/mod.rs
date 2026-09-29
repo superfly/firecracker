@@ -3,12 +3,14 @@
 
 pub mod async_io;
 pub mod sync_io;
+pub mod threaded_io;
 
 use std::fmt::Debug;
 use std::fs::File;
 
 pub use self::async_io::{AsyncFileEngine, AsyncIoError};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
+pub use self::threaded_io::{ThreadedFileEngine, ThreadedIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
@@ -31,6 +33,8 @@ pub enum BlockIoError {
     Sync(SyncIoError),
     /// Async error: {0}
     Async(AsyncIoError),
+    /// Threaded error: {0}
+    Threaded(ThreadedIoError),
 }
 
 impl BlockIoError {
@@ -54,6 +58,7 @@ pub enum FileEngine {
     #[allow(unused)]
     Async(AsyncFileEngine),
     Sync(SyncFileEngine),
+    Threaded(ThreadedFileEngine),
 }
 
 impl FileEngine {
@@ -63,6 +68,9 @@ impl FileEngine {
                 AsyncFileEngine::from_file(file).map_err(BlockIoError::Async)?,
             )),
             FileEngineType::Sync => Ok(FileEngine::Sync(SyncFileEngine::from_file(file))),
+            FileEngineType::Threaded => Ok(FileEngine::Threaded(
+                ThreadedFileEngine::from_file(file).map_err(BlockIoError::Threaded)?,
+            )),
         }
     }
 
@@ -70,6 +78,9 @@ impl FileEngine {
         match self {
             FileEngine::Async(engine) => engine.update_file(file).map_err(BlockIoError::Async)?,
             FileEngine::Sync(engine) => engine.update_file(file),
+            FileEngine::Threaded(engine) => {
+                engine.update_file(file).map_err(BlockIoError::Threaded)?
+            }
         };
 
         Ok(())
@@ -80,6 +91,7 @@ impl FileEngine {
         match self {
             FileEngine::Async(engine) => engine.file(),
             FileEngine::Sync(engine) => engine.file(),
+            FileEngine::Threaded(engine) => engine.file(),
         }
     }
 
@@ -99,6 +111,13 @@ impl FileEngine {
                     error: BlockIoError::Async(err.error),
                 }),
             },
+            FileEngine::Threaded(_) => {
+                let err = ThreadedFileEngine::refuse(req);
+                Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Threaded(err.error),
+                })
+            }
             FileEngine::Sync(engine) => match engine.read(offset, mem, addr, count) {
                 Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
                 Err(err) => Err(RequestError {
@@ -125,6 +144,13 @@ impl FileEngine {
                     error: BlockIoError::Async(err.error),
                 }),
             },
+            FileEngine::Threaded(_) => {
+                let err = ThreadedFileEngine::refuse(req);
+                Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Threaded(err.error),
+                })
+            }
             FileEngine::Sync(engine) => match engine.write(offset, mem, addr, count) {
                 Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
                 Err(err) => Err(RequestError {
@@ -147,6 +173,13 @@ impl FileEngine {
                     error: BlockIoError::Async(err.error),
                 }),
             },
+            FileEngine::Threaded(_) => {
+                let err = ThreadedFileEngine::refuse(req);
+                Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Threaded(err.error),
+                })
+            }
             FileEngine::Sync(engine) => match engine.flush() {
                 Ok(_) => Ok(FileEngineOk::Executed(RequestOk { req, count: 0 })),
                 Err(err) => Err(RequestError {
@@ -161,6 +194,7 @@ impl FileEngine {
         match self {
             FileEngine::Async(engine) => engine.drain(discard).map_err(BlockIoError::Async),
             FileEngine::Sync(_engine) => Ok(()),
+            FileEngine::Threaded(engine) => engine.drain(discard).map_err(BlockIoError::Threaded),
         }
     }
 
@@ -170,6 +204,9 @@ impl FileEngine {
                 engine.drain_and_flush(discard).map_err(BlockIoError::Async)
             }
             FileEngine::Sync(engine) => engine.flush().map_err(BlockIoError::Sync),
+            FileEngine::Threaded(engine) => engine
+                .drain_and_flush(discard)
+                .map_err(BlockIoError::Threaded),
         }
     }
 }

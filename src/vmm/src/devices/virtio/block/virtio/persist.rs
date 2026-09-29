@@ -30,6 +30,8 @@ pub enum FileEngineTypeState {
     Sync,
     /// Async File Engine.
     Async,
+    /// Threaded File Engine.
+    Threaded,
 }
 
 impl From<FileEngineType> for FileEngineTypeState {
@@ -37,6 +39,7 @@ impl From<FileEngineType> for FileEngineTypeState {
         match file_engine_type {
             FileEngineType::Sync => FileEngineTypeState::Sync,
             FileEngineType::Async => FileEngineTypeState::Async,
+            FileEngineType::Threaded => FileEngineTypeState::Threaded,
         }
     }
 }
@@ -46,6 +49,7 @@ impl From<FileEngineTypeState> for FileEngineType {
         match file_engine_type_state {
             FileEngineTypeState::Sync => FileEngineType::Sync,
             FileEngineTypeState::Async => FileEngineType::Async,
+            FileEngineTypeState::Threaded => FileEngineType::Threaded,
         }
     }
 }

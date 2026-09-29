@@ -122,6 +122,10 @@ pub fn simulate_queue_and_async_completion_events(b: &mut VirtioBlock, expected_
         FileEngine::Sync(_) => {
             simulate_queue_event(b, Some(expected_irq));
         }
+        // The threaded engine's worker serves its queue on its own.
+        FileEngine::Threaded(_) => {
+            simulate_queue_event(b, Some(expected_irq));
+        }
     }
 }
 

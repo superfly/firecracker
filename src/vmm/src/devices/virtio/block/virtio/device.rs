@@ -53,6 +53,8 @@ pub enum FileEngineType {
     /// Use a Sync engine, based on blocking system calls.
     #[default]
     Sync,
+    /// Use a Threaded engine: blocking system calls, made from a worker thread per drive.
+    Threaded,
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
@@ -275,7 +277,7 @@ macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
             FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
+            _ => {
                 error!("The block device doesn't use an async IO engine");
                 return;
             }
@@ -345,7 +347,9 @@ impl VirtioBlock {
 
     /// Returns a copy of a device config
     pub fn config(&self) -> VirtioBlockConfig {
-        let rl: RateLimiterConfig = (&self.rate_limiter).into();
+        let rl: RateLimiterConfig = self
+            .threaded_rate_limiter_config()
+            .unwrap_or_else(|| (&self.rate_limiter).into());
         VirtioBlockConfig {
             drive_id: self.id.clone(),
             path_on_host: self.disk.file_path.clone(),
@@ -378,6 +382,9 @@ impl VirtioBlock {
 
     /// Process device virtio queue(s).
     pub fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
+        if self.threaded_kick() {
+            return Ok(());
+        }
         self.process_queue(0)
     }
 
@@ -541,6 +548,7 @@ impl VirtioBlock {
     /// Update the backing file and the config space of the block device.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
         self.disk.update(disk_image_path, self.read_only)?;
+        self.threaded_disk_updated();
         self.config_space.capacity = self.disk.nsectors.to_le(); // virtio_block_config_space();
 
         // Kick the driver to pick up the changes. (But only if the device is already activated).
@@ -556,7 +564,9 @@ impl VirtioBlock {
 
     /// Updates the parameters for the rate limiter
     pub fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
-        self.rate_limiter.update_buckets(bytes, ops);
+        if let Some((bytes, ops)) = self.threaded_update_rate_limiter(bytes, ops) {
+            self.rate_limiter.update_buckets(bytes, ops);
+        }
     }
 
     /// Retrieve the file engine type.
@@ -564,6 +574,7 @@ impl VirtioBlock {
         match self.disk.file_engine {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
+            FileEngine::Threaded(_) => FileEngineType::Threaded,
         }
     }
 
@@ -579,6 +590,7 @@ impl VirtioBlock {
             return;
         }
 
+        self.threaded_stop();
         self.drain_and_flush(false);
         if let FileEngine::Async(ref _engine) = self.disk.file_engine {
             self.process_async_completion_queue();
@@ -679,6 +691,7 @@ impl VirtioDevice for VirtioBlock {
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
+        self.threaded_stop();
         match self.cache_type {
             CacheType::Unsafe => {
                 if let Err(err) = self.disk.file_engine.drain(true) {
