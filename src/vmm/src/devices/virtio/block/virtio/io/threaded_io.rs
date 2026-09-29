@@ -12,10 +12,16 @@
 //! Requests are vectored: one request carries up to [`THREADED_SEG_MAX`] guest buffers and is
 //! served by a single `preadv`/`pwritev`. They are handed to the worker in batches, one per
 //! [`ThreadedFileEngine::kick`], so that a pass over the virtqueue wakes the worker once.
+//!
+//! While the backing file is fast, the submitter waits for the completions right after the kick,
+//! for up to [`POLL_BUDGET`], see [`ThreadedFileEngine::kick_and_poll`]. A request is then submitted and
+//! completed in one wake-up of the event loop, as with the sync engine, where the eventfd would
+//! take a second one.
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,6 +46,10 @@ pub const THREADED_IO_MAX_IN_FLIGHT: usize = 128;
 /// cache writeback means one per 4 KiB page. Indirect descriptors are not supported, so a
 /// request takes this many entries of the 256-entry queue, plus two.
 pub const THREADED_SEG_MAX: u32 = 32;
+
+/// How long the submitter waits for completions after a kick, at most. This is time the event
+/// loop serves nothing else, so it has to stay far below what any other device would notice.
+pub const POLL_BUDGET: Duration = Duration::from_micros(100);
 
 /// A guest buffer: its address and length.
 pub type Segment = (GuestAddress, u32);
@@ -84,6 +94,15 @@ pub enum ThreadedIoError {
     QueueFull,
     /// The IO worker thread is gone
     WorkerGone,
+}
+
+/// What the submitter tells the worker about the completions it needs no signal for.
+#[derive(Debug, Default)]
+struct Received {
+    // Set while the submitter is polling for completions.
+    polling: AtomicBool,
+    // How many completions the submitter has received so far.
+    count: AtomicU64,
 }
 
 /// A finished request, as reported by the worker thread.
@@ -250,14 +269,19 @@ struct CompletionSignal {
     evt: EventFd,
     pending: bool,
     last: Instant,
+    // How many completions were sent so far.
+    sent: u64,
+    received: Arc<Received>,
 }
 
 impl CompletionSignal {
-    fn new(evt: EventFd) -> Self {
+    fn new(evt: EventFd, received: Arc<Received>) -> Self {
         CompletionSignal {
             evt,
             pending: false,
             last: Instant::now(),
+            sent: 0,
+            received,
         }
     }
 
@@ -273,10 +297,18 @@ impl CompletionSignal {
         if !self.pending {
             return;
         }
+        self.pending = false;
+        // No signal for completions the submitter already has, or is about to get: they were
+        // sent before this check, and the submitter looks for completions once more after it
+        // stops polling, so it cannot miss them.
+        if self.received.count.load(Ordering::SeqCst) >= self.sent
+            || self.received.polling.load(Ordering::SeqCst)
+        {
+            return;
+        }
         if let Err(err) = self.evt.write(1) {
             error!("Failed to signal block IO completion: {:?}", err);
         }
-        self.pending = false;
         self.last = Instant::now();
     }
 }
@@ -286,6 +318,7 @@ fn run_worker(
     batches: mpsc::Receiver<Vec<Op>>,
     completions: mpsc::Sender<ThreadedCompletion>,
     completion_evt: EventFd,
+    received: Arc<Received>,
 ) {
     if let Some(filter) = worker_seccomp_filter()
         && let Err(err) = crate::seccomp::apply_filter(filter)
@@ -293,7 +326,7 @@ fn run_worker(
         panic!("Failed to set the requested seccomp filters on the block IO worker: {err}");
     }
 
-    let mut signal = CompletionSignal::new(completion_evt);
+    let mut signal = CompletionSignal::new(completion_evt, received);
     let mut queue = VecDeque::new();
     loop {
         let op = match queue.pop_front() {
@@ -331,6 +364,7 @@ fn run_worker(
         if completions.send(completion).is_err() {
             break;
         }
+        signal.sent += 1;
         signal.pending = true;
 
         // Hold the signal back while more requests are queued, so that the device handles a
@@ -358,8 +392,15 @@ pub struct ThreadedFileEngine {
     // Requests pushed since the last kick.
     batch: Vec<Op>,
     completions: mpsc::Receiver<ThreadedCompletion>,
+    // Completions received while polling, not popped yet.
+    ready: VecDeque<ThreadedCompletion>,
     completion_evt: EventFd,
     in_flight: usize,
+    received: Arc<Received>,
+    // Whether the backing file has been answering within the poll budget.
+    poll_pays: bool,
+    poll_budget: Option<Duration>,
+    last_kick: Instant,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -372,10 +413,20 @@ impl ThreadedFileEngine {
         let worker_file = file.try_clone().map_err(ThreadedIoError::FileClone)?;
         let (batches, worker_batches) = mpsc::channel();
         let (worker_completions, completions) = mpsc::channel();
+        let received = Arc::new(Received::default());
+        let worker_received = received.clone();
 
         let worker = thread::Builder::new()
             .name("fc_blk_io".to_string())
-            .spawn(move || run_worker(worker_file, worker_batches, worker_completions, worker_evt))
+            .spawn(move || {
+                run_worker(
+                    worker_file,
+                    worker_batches,
+                    worker_completions,
+                    worker_evt,
+                    worker_received,
+                )
+            })
             .map_err(ThreadedIoError::Spawn)?;
 
         Ok(ThreadedFileEngine {
@@ -383,8 +434,14 @@ impl ThreadedFileEngine {
             batches,
             batch: Vec::new(),
             completions,
+            ready: VecDeque::new(),
             completion_evt,
             in_flight: 0,
+            received,
+            // Tests expect completions to take the completion event, unless they ask for this.
+            poll_pays: !cfg!(test),
+            poll_budget: (!cfg!(test)).then_some(POLL_BUDGET),
+            last_kick: Instant::now(),
             worker: Some(worker),
         })
     }
@@ -411,6 +468,7 @@ impl ThreadedFileEngine {
         if self.batch.is_empty() {
             return Ok(());
         }
+        self.last_kick = Instant::now();
         self.batches
             .send(std::mem::take(&mut self.batch))
             .map_err(|_| ThreadedIoError::WorkerGone)
@@ -493,9 +551,75 @@ impl ThreadedFileEngine {
 
     /// Pop a finished request, if there is one.
     pub fn pop(&mut self) -> Option<ThreadedCompletion> {
-        let completion = self.completions.try_recv().ok()?;
+        let completion = match self.ready.pop_front() {
+            Some(completion) => completion,
+            None => {
+                let completion = self.receive()?;
+                // Completions that take the slow path tell how fast the backing file is.
+                if self.in_flight == 1
+                    && let Some(budget) = self.poll_budget
+                {
+                    self.poll_pays = self.last_kick.elapsed() < budget;
+                }
+                completion
+            }
+        };
         self.in_flight -= 1;
         Some(completion)
+    }
+
+    /// Take a completion from the worker, and let it know.
+    fn receive(&mut self) -> Option<ThreadedCompletion> {
+        let completion = self.completions.try_recv().ok()?;
+        self.received.count.fetch_add(1, Ordering::SeqCst);
+        Some(completion)
+    }
+
+    /// Turn waiting for completions after a kick on or off, see [`Self::kick_and_poll`].
+    pub fn set_poll_budget(&mut self, budget: Option<Duration>) {
+        self.poll_budget = budget;
+        self.poll_pays = budget.is_some();
+    }
+
+    /// Hand the requests pushed since the last kick to the worker, then wait for the completions
+    /// of everything in flight, for up to the poll budget, and only while the backing file has
+    /// been answering within it. Returns whether there are completions to pop.
+    ///
+    /// The worker does not signal the completions it finishes meanwhile.
+    pub fn kick_and_poll(&mut self) -> Result<bool, ThreadedIoError> {
+        let budget = match self.poll_budget {
+            Some(budget) if self.poll_pays && self.in_flight > self.ready.len() => budget,
+            _ => {
+                self.kick()?;
+                return Ok(!self.ready.is_empty());
+            }
+        };
+
+        // Before the worker gets the requests, so that it signals none of them.
+        self.received.polling.store(true, Ordering::SeqCst);
+        let kicked = self.kick();
+        let deadline = Instant::now() + budget;
+        while kicked.is_ok() {
+            while let Some(completion) = self.receive() {
+                self.ready.push_back(completion);
+            }
+            if self.in_flight == self.ready.len() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                // Too slow to wait for. Completions popped later say when that changes.
+                self.poll_pays = false;
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        self.received.polling.store(false, Ordering::SeqCst);
+        // What the worker finished before it could see the flag cleared went unsignalled.
+        while let Some(completion) = self.receive() {
+            self.ready.push_back(completion);
+        }
+
+        kicked.map(|_| !self.ready.is_empty())
     }
 
     /// Wait for every submitted request to complete. Their completions are left to be popped,
@@ -768,6 +892,67 @@ mod tests {
         // A kick with nothing pushed is a no-op.
         engine.kick().unwrap();
         assert!(engine.pop().is_none());
+    }
+
+    #[test]
+    fn test_kick_and_poll() {
+        let mem = create_mem();
+        let mut engine = new_engine();
+        let push = |engine: &mut ThreadedFileEngine, count| {
+            for _ in 0..count {
+                engine
+                    .push_write(
+                        0,
+                        &mem,
+                        GuestAddress(0),
+                        FILE_LEN,
+                        PendingRequest::default(),
+                    )
+                    .unwrap();
+            }
+        };
+
+        // With time to wait, everything in flight completes in the call, unsignalled.
+        engine.set_poll_budget(Some(Duration::from_secs(10)));
+        push(&mut engine, 4);
+        assert!(engine.kick_and_poll().unwrap());
+        engine.completion_evt().read().unwrap_err();
+        for _ in 0..4 {
+            assert_eq!(engine.pop().unwrap().result.unwrap(), FILE_LEN);
+        }
+        assert!(engine.pop().is_none());
+        // Nothing in flight, nothing to wait for.
+        assert!(!engine.kick_and_poll().unwrap());
+
+        // With no time to wait, completions are signalled, and polling stops...
+        engine.set_poll_budget(Some(Duration::ZERO));
+        push(&mut engine, 1);
+        assert!(!engine.kick_and_poll().unwrap());
+        assert!(!engine.poll_pays);
+        wait_for_signal(&engine);
+        assert_eq!(engine.pop().unwrap().result.unwrap(), FILE_LEN);
+        assert!(!engine.poll_pays);
+        push(&mut engine, 1);
+        assert!(!engine.kick_and_poll().unwrap());
+        wait_for_signal(&engine);
+
+        // ...until a completion shows the backing file answers within the budget again.
+        engine.poll_budget = Some(Duration::from_secs(10));
+        assert_eq!(engine.pop().unwrap().result.unwrap(), FILE_LEN);
+        assert!(engine.poll_pays);
+        push(&mut engine, 2);
+        assert!(engine.kick_and_poll().unwrap());
+        engine.completion_evt().read().unwrap_err();
+        assert_eq!(engine.in_flight, 2);
+        engine.drain(true).unwrap();
+        assert_eq!(engine.in_flight, 0);
+
+        // Turned off, a kick is only a kick.
+        engine.set_poll_budget(None);
+        push(&mut engine, 1);
+        assert!(!engine.kick_and_poll().unwrap());
+        wait_for_signal(&engine);
+        assert_eq!(engine.pop().unwrap().result.unwrap(), FILE_LEN);
     }
 
     #[test]

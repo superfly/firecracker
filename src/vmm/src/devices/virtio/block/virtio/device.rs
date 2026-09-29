@@ -469,11 +469,7 @@ impl VirtioBlock {
         {
             error!("BlockError submitting pending block requests: {:?}", err);
         }
-        if let FileEngine::Threaded(ref mut engine) = self.disk.file_engine
-            && let Err(err) = engine.kick()
-        {
-            error!("BlockError submitting pending block requests: {:?}", err);
-        }
+        self.threaded_kick();
 
         if !used_any {
             self.metrics.no_avail_buffer.inc();

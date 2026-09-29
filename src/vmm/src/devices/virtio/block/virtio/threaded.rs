@@ -226,6 +226,25 @@ impl VirtioBlock {
         }
     }
 
+    /// Hand the requests of a pass over the queue to the worker and, while the backing file is
+    /// fast, wait for them and complete them right away.
+    pub(crate) fn threaded_kick(&mut self) {
+        let FileEngine::Threaded(engine) = &mut self.disk.file_engine else {
+            return;
+        };
+        // A throttled device resumes its queue from the completion event.
+        let completed = if self.is_io_engine_throttled {
+            engine.kick().map(|_| false)
+        } else {
+            engine.kick_and_poll()
+        };
+        match completed {
+            Ok(true) => self.process_threaded_completion_queue(),
+            Ok(false) => {}
+            Err(err) => error!("BlockError submitting pending block requests: {:?}", err),
+        }
+    }
+
     /// Add every request the worker finished to the used ring, and notify the guest.
     pub(crate) fn process_threaded_completion_queue(&mut self) {
         let FileEngine::Threaded(engine) = &mut self.disk.file_engine else {
@@ -572,6 +591,36 @@ mod tests {
             Request::parse_segmented(&head, &mem, 8),
             Err(VirtioBlockError::UnexpectedReadOnlyDescriptor)
         ));
+    }
+
+    #[test]
+    fn test_completed_in_the_queue_event() {
+        let mut block = default_block(FileEngineType::Threaded);
+        let FileEngine::Threaded(engine) = &mut block.disk.file_engine else {
+            unreachable!()
+        };
+        engine.set_poll_budget(Some(std::time::Duration::from_secs(10)));
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+
+        // The write is submitted, completed and notified in one queue event.
+        mem.write_obj::<u64>(123_456_789, GuestAddress(0x2000))
+            .unwrap();
+        let status_addr = set_segmented_request(&vq, VIRTIO_BLK_T_OUT, 0, &[(0x2000, 512)]);
+        simulate_queue_event(&mut block, Some(true));
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(
+            u32::from(mem.read_obj::<u8>(status_addr).unwrap()),
+            VIRTIO_BLK_S_OK
+        );
+        // The completion event has nothing left to do.
+        let FileEngine::Threaded(engine) = &mut block.disk.file_engine else {
+            unreachable!()
+        };
+        engine.completion_evt().read().unwrap_err();
+        assert!(engine.pop().is_none());
     }
 
     #[test]
