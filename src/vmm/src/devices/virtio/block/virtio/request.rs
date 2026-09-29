@@ -208,6 +208,10 @@ pub struct RequestHeader {
 unsafe impl ByteValued for RequestHeader {}
 
 impl RequestHeader {
+    pub(super) fn type_and_sector(&self) -> (RequestType, u64) {
+        (RequestType::from(self.request_type), self.sector)
+    }
+
     pub fn new(request_type: u32, sector: u64) -> RequestHeader {
         RequestHeader {
             request_type,
@@ -236,8 +240,10 @@ pub struct Request {
     pub r#type: RequestType,
     pub data_len: u32,
     pub status_addr: GuestAddress,
-    sector: u64,
-    data_addr: GuestAddress,
+    pub(super) sector: u64,
+    pub(super) data_addr: GuestAddress,
+    /// The data buffers of a request parsed with `parse_segmented`, `data_len` bytes in total.
+    pub(super) segments: Vec<(GuestAddress, u32)>,
 }
 
 impl Request {
@@ -258,6 +264,7 @@ impl Request {
             data_addr: GuestAddress(0),
             data_len: 0,
             status_addr: GuestAddress(0),
+            segments: Vec::new(),
         };
 
         let data_desc;
@@ -354,7 +361,7 @@ impl Request {
         self.sector << SECTOR_SHIFT
     }
 
-    fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
+    pub(super) fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
         PendingRequest {
             r#type: self.r#type,
             data_len: self.data_len,
@@ -370,6 +377,10 @@ impl Request {
         mem: &GuestMemoryMmap,
         block_metrics: &BlockDeviceMetrics,
     ) -> ProcessingResult {
+        if !self.segments.is_empty() {
+            return self.process_segmented(disk, desc_idx, mem, block_metrics);
+        }
+
         let pending = self.to_pending_request(desc_idx);
         let res = match self.r#type {
             RequestType::In => {
@@ -834,6 +845,7 @@ mod tests {
             status_addr,
             sector: sector & (NUM_DISK_SECTORS - sectors_len),
             data_addr,
+            segments: Vec::new(),
         };
         let mut request_header = RequestHeader::new(virtio_request_id, request.sector);
 

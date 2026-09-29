@@ -314,6 +314,8 @@ impl VirtioBlock {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
         };
 
+        avail_features |= Self::threaded_features(config.file_engine_type);
+
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
 
         let queues = BLOCK_QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
@@ -397,13 +399,14 @@ impl VirtioBlock {
         // This is safe since we checked in the event handler that the device is activated.
         let active_state = self.device_state.active_state().unwrap();
 
+        let segmented = self.accepts_segments();
         let queue = &mut self.queues[queue_index];
         let mut used_any = false;
 
         while let Some(head) = queue.pop_or_enable_notification()? {
             self.metrics.remaining_reqs_count.add(queue.len().into());
             let processing_result =
-                match Request::parse(&head, &active_state.mem, self.disk.nsectors) {
+                match Request::parse_any(&head, &active_state.mem, self.disk.nsectors, segmented) {
                     Ok(request) => {
                         if request.rate_limit(&mut self.rate_limiter) {
                             // Stop processing the queue and return this descriptor chain to the
@@ -463,6 +466,11 @@ impl VirtioBlock {
 
         if let FileEngine::Async(ref mut engine) = self.disk.file_engine
             && let Err(err) = engine.kick_submission_queue()
+        {
+            error!("BlockError submitting pending block requests: {:?}", err);
+        }
+        if let FileEngine::Threaded(ref mut engine) = self.disk.file_engine
+            && let Err(err) = engine.kick()
         {
             error!("BlockError submitting pending block requests: {:?}", err);
         }
@@ -626,6 +634,9 @@ impl VirtioDevice for VirtioBlock {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
+        if self.threaded_read_config(offset, data) {
+            return;
+        }
         if let Some(config_space_bytes) = self.config_space.as_slice().get(u64_to_usize(offset)..) {
             let len = config_space_bytes.len().min(data.len());
             data[..len].copy_from_slice(&config_space_bytes[..len]);

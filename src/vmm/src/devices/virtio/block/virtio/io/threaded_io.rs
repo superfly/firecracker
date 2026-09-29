@@ -8,25 +8,41 @@
 //! completions through an eventfd, the way the async engine does. A slow backing file then stalls
 //! only its own worker, not the event loop and every other device serviced there, and no
 //! io_uring support is needed.
+//!
+//! Requests are vectored: one request carries up to [`THREADED_SEG_MAX`] guest buffers and is
+//! served by a single `preadv`/`pwritev`. They are handed to the worker in batches, one per
+//! [`ThreadedFileEngine::kick`], so that a pass over the virtqueue wakes the worker once.
 
+use std::collections::VecDeque;
 use std::fs::File;
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use vm_memory::GuestMemoryError;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::sync_io::{SyncFileEngine, SyncIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::io::RequestError;
 use crate::logger::error;
 use crate::seccomp::{BpfProgram, BpfProgramRef};
-use crate::vstate::memory::{GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
+use crate::vstate::memory::{GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap};
 
 /// Maximum number of requests submitted to the worker and not yet popped. The engine reports
 /// itself as throttled beyond this, and the device resumes processing its queue once completions
 /// come back.
 pub const THREADED_IO_MAX_IN_FLIGHT: usize = 128;
+
+/// Maximum number of data buffers in one request, advertised to the guest as `seg_max`.
+///
+/// Without it a guest must send one request per physically contiguous buffer, which for page
+/// cache writeback means one per 4 KiB page. Indirect descriptors are not supported, so a
+/// request takes this many entries of the 256-entry queue, plus two.
+pub const THREADED_SEG_MAX: u32 = 32;
+
+/// A guest buffer: its address and length.
+pub type Segment = (GuestAddress, u32);
 
 /// How long a finished request may wait for the requests queued behind it before the device is
 /// told about it.
@@ -50,8 +66,14 @@ fn worker_seccomp_filter() -> Option<BpfProgramRef<'static>> {
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ThreadedIoError {
-    /// IO: {0}
-    Io(SyncIoError),
+    /// Read: {0}
+    Read(std::io::Error),
+    /// Write: {0}
+    Write(std::io::Error),
+    /// SyncAll: {0}
+    SyncAll(std::io::Error),
+    /// Guest memory: {0}
+    GuestMemory(GuestMemoryError),
     /// EventFd: {0}
     EventFd(std::io::Error),
     /// Cloning the backing file: {0}
@@ -76,40 +98,135 @@ enum Io {
     Read {
         offset: u64,
         mem: GuestMemoryMmap,
-        addr: GuestAddress,
-        count: u32,
+        segments: Vec<Segment>,
     },
     Write {
         offset: u64,
         mem: GuestMemoryMmap,
-        addr: GuestAddress,
-        count: u32,
+        segments: Vec<Segment>,
     },
     Flush,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Read,
+    Write,
+}
+
+/// Transfer `segments` from or to `file` at `offset` with positioned, vectored IO: one system
+/// call, unless the kernel transfers less than asked.
+fn transfer(
+    file: &File,
+    direction: Direction,
+    mut offset: u64,
+    mem: &GuestMemoryMmap,
+    segments: &[Segment],
+) -> Result<u32, ThreadedIoError> {
+    let mut iovecs = Vec::with_capacity(segments.len());
+    let mut total: u32 = 0;
+    for &(addr, len) in segments {
+        let slice = mem
+            .get_slice(addr, len as usize)
+            .map_err(ThreadedIoError::GuestMemory)?;
+        iovecs.push(libc::iovec {
+            iov_base: slice.ptr_guard_mut().as_ptr().cast(),
+            iov_len: len as usize,
+        });
+        total = total.checked_add(len).ok_or(ThreadedIoError::GuestMemory(
+            GuestMemoryError::GuestAddressOverflow,
+        ))?;
+    }
+
+    let io_error = |err| match direction {
+        Direction::Read => ThreadedIoError::Read(err),
+        Direction::Write => ThreadedIoError::Write(err),
+    };
+
+    let mut iovecs = iovecs.as_mut_slice();
+    while !iovecs.is_empty() {
+        let iovcnt = libc::c_int::try_from(iovecs.len()).unwrap_or(libc::c_int::MAX);
+        let offset_arg =
+            libc::off_t::try_from(offset).map_err(|_| io_error(libc::EOVERFLOW.into_io()))?;
+        // SAFETY: the iovecs point into guest memory that `mem`, which outlives the call, keeps
+        // mapped, each within the bounds `get_slice` checked.
+        let ret = unsafe {
+            match direction {
+                Direction::Read => {
+                    libc::preadv(file.as_raw_fd(), iovecs.as_ptr(), iovcnt, offset_arg)
+                }
+                Direction::Write => {
+                    libc::pwritev(file.as_raw_fd(), iovecs.as_ptr(), iovcnt, offset_arg)
+                }
+            }
+        };
+        let mut done = match usize::try_from(ret) {
+            Ok(0) => {
+                return Err(io_error(match direction {
+                    Direction::Read => std::io::ErrorKind::UnexpectedEof.into(),
+                    Direction::Write => std::io::ErrorKind::WriteZero.into(),
+                }));
+            }
+            Ok(done) => done,
+            Err(_) => {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(io_error(err));
+            }
+        };
+        offset += done as u64;
+
+        // Skip what was transferred: whole buffers first, then the start of the next one.
+        while let Some(first) = iovecs.first_mut() {
+            if done < first.iov_len {
+                // SAFETY: `done` is within the buffer.
+                first.iov_base = unsafe { first.iov_base.add(done) };
+                first.iov_len -= done;
+                break;
+            }
+            done -= first.iov_len;
+            iovecs = &mut iovecs[1..];
+        }
+    }
+
+    Ok(total)
+}
+
+trait IntoIoError {
+    fn into_io(self) -> std::io::Error;
+}
+
+impl IntoIoError for libc::c_int {
+    fn into_io(self) -> std::io::Error {
+        std::io::Error::from_raw_os_error(self)
+    }
+}
+
 impl Io {
-    fn execute(self, file: &mut SyncFileEngine) -> Result<u32, SyncIoError> {
+    fn execute(self, file: &File) -> Result<u32, ThreadedIoError> {
         match self {
             Io::Read {
                 offset,
                 mem,
-                addr,
-                count,
+                segments,
             } => {
-                let count = file.read(offset, &mem, addr, count)?;
+                let count = transfer(file, Direction::Read, offset, &mem, &segments)?;
                 // The guest memory was written from this thread, so account for it in the dirty
                 // bitmap before the device gets to see the completion.
-                mem.mark_dirty(addr, count as usize);
+                for (addr, len) in segments {
+                    mem.mark_dirty(addr, len as usize);
+                }
                 Ok(count)
             }
             Io::Write {
                 offset,
                 mem,
-                addr,
-                count,
-            } => file.write(offset, &mem, addr, count),
-            Io::Flush => file.flush().map(|_| 0),
+                segments,
+            } => transfer(file, Direction::Write, offset, &mem, &segments),
+            // Sync data out to physical media on host.
+            Io::Flush => file.sync_all().map(|_| 0).map_err(ThreadedIoError::SyncAll),
         }
     }
 }
@@ -165,8 +282,8 @@ impl CompletionSignal {
 }
 
 fn run_worker(
-    mut file: SyncFileEngine,
-    ops: mpsc::Receiver<Op>,
+    mut file: File,
+    batches: mpsc::Receiver<Vec<Op>>,
     completions: mpsc::Sender<ThreadedCompletion>,
     completion_evt: EventFd,
 ) {
@@ -177,15 +294,18 @@ fn run_worker(
     }
 
     let mut signal = CompletionSignal::new(completion_evt);
-    let mut next = None;
+    let mut queue = VecDeque::new();
     loop {
-        let op = match next.take() {
+        let op = match queue.pop_front() {
             Some(op) => op,
             None => {
                 // Never go to sleep on a completion the device has not been told about.
                 signal.flush();
-                match ops.recv() {
-                    Ok(op) => op,
+                match batches.recv() {
+                    Ok(batch) => {
+                        queue.extend(batch);
+                        continue;
+                    }
                     Err(mpsc::RecvError) => break,
                 }
             }
@@ -194,10 +314,10 @@ fn run_worker(
         let completion = match op {
             Op::Io { io, req } => ThreadedCompletion {
                 req,
-                result: io.execute(&mut file).map_err(ThreadedIoError::Io),
+                result: io.execute(&file),
             },
             Op::UpdateFile(new_file) => {
-                file.update_file(new_file);
+                file = new_file;
                 continue;
             }
             Op::Barrier(ack) => {
@@ -216,12 +336,15 @@ fn run_worker(
         // Hold the signal back while more requests are queued, so that the device handles a
         // burst of completions at once instead of raising an interrupt for each. Only while the
         // previous signal is recent, though: a slow backing file gets one after every request.
-        match ops.try_recv() {
-            Ok(op) => {
-                next = Some(op);
-                signal.maybe_flush();
-            }
-            Err(_) => signal.flush(),
+        if queue.is_empty()
+            && let Ok(batch) = batches.try_recv()
+        {
+            queue.extend(batch);
+        }
+        if queue.is_empty() {
+            signal.flush();
+        } else {
+            signal.maybe_flush();
         }
     }
     signal.flush();
@@ -231,7 +354,9 @@ fn run_worker(
 #[derive(Debug)]
 pub struct ThreadedFileEngine {
     file: File,
-    ops: mpsc::Sender<Op>,
+    batches: mpsc::Sender<Vec<Op>>,
+    // Requests pushed since the last kick.
+    batch: Vec<Op>,
     completions: mpsc::Receiver<ThreadedCompletion>,
     completion_evt: EventFd,
     in_flight: usize,
@@ -244,19 +369,19 @@ impl ThreadedFileEngine {
         let worker_evt = completion_evt
             .try_clone()
             .map_err(ThreadedIoError::EventFd)?;
-        let worker_file =
-            SyncFileEngine::from_file(file.try_clone().map_err(ThreadedIoError::FileClone)?);
-        let (ops, worker_ops) = mpsc::channel();
+        let worker_file = file.try_clone().map_err(ThreadedIoError::FileClone)?;
+        let (batches, worker_batches) = mpsc::channel();
         let (worker_completions, completions) = mpsc::channel();
 
         let worker = thread::Builder::new()
             .name("fc_blk_io".to_string())
-            .spawn(move || run_worker(worker_file, worker_ops, worker_completions, worker_evt))
+            .spawn(move || run_worker(worker_file, worker_batches, worker_completions, worker_evt))
             .map_err(ThreadedIoError::Spawn)?;
 
         Ok(ThreadedFileEngine {
             file,
-            ops,
+            batches,
+            batch: Vec::new(),
             completions,
             completion_evt,
             in_flight: 0,
@@ -272,15 +397,29 @@ impl ThreadedFileEngine {
     /// Update the backing file of the engine
     pub fn update_file(&mut self, file: File) -> Result<(), ThreadedIoError> {
         let worker_file = file.try_clone().map_err(ThreadedIoError::FileClone)?;
-        self.ops
-            .send(Op::UpdateFile(worker_file))
-            .map_err(|_| ThreadedIoError::WorkerGone)?;
+        self.send(Op::UpdateFile(worker_file))?;
         self.file = file;
         Ok(())
     }
 
     pub fn completion_evt(&self) -> &EventFd {
         &self.completion_evt
+    }
+
+    /// Hand the requests pushed since the last kick to the worker.
+    pub fn kick(&mut self) -> Result<(), ThreadedIoError> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        self.batches
+            .send(std::mem::take(&mut self.batch))
+            .map_err(|_| ThreadedIoError::WorkerGone)
+    }
+
+    /// Send a control op, behind everything pushed so far.
+    fn send(&mut self, op: Op) -> Result<(), ThreadedIoError> {
+        self.batch.push(op);
+        self.kick()
     }
 
     fn push(&mut self, io: Io, req: PendingRequest) -> Result<(), RequestError<ThreadedIoError>> {
@@ -291,17 +430,39 @@ impl ThreadedFileEngine {
             });
         }
 
-        match self.ops.send(Op::Io { io, req }) {
-            Ok(()) => {
-                self.in_flight += 1;
-                Ok(())
-            }
-            Err(mpsc::SendError(Op::Io { req, .. })) => Err(RequestError {
-                req,
-                error: ThreadedIoError::WorkerGone,
-            }),
-            Err(_) => unreachable!("sent an IO op"),
-        }
+        self.batch.push(Op::Io { io, req });
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    pub fn push_readv(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: Vec<Segment>,
+        req: PendingRequest,
+    ) -> Result<(), RequestError<ThreadedIoError>> {
+        let io = Io::Read {
+            offset,
+            mem: mem.clone(),
+            segments,
+        };
+        self.push(io, req)
+    }
+
+    pub fn push_writev(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: Vec<Segment>,
+        req: PendingRequest,
+    ) -> Result<(), RequestError<ThreadedIoError>> {
+        let io = Io::Write {
+            offset,
+            mem: mem.clone(),
+            segments,
+        };
+        self.push(io, req)
     }
 
     pub fn push_read(
@@ -312,13 +473,7 @@ impl ThreadedFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<ThreadedIoError>> {
-        let io = Io::Read {
-            offset,
-            mem: mem.clone(),
-            addr,
-            count,
-        };
-        self.push(io, req)
+        self.push_readv(offset, mem, vec![(addr, count)], req)
     }
 
     pub fn push_write(
@@ -329,13 +484,7 @@ impl ThreadedFileEngine {
         count: u32,
         req: PendingRequest,
     ) -> Result<(), RequestError<ThreadedIoError>> {
-        let io = Io::Write {
-            offset,
-            mem: mem.clone(),
-            addr,
-            count,
-        };
-        self.push(io, req)
+        self.push_writev(offset, mem, vec![(addr, count)], req)
     }
 
     pub fn push_flush(&mut self, req: PendingRequest) -> Result<(), RequestError<ThreadedIoError>> {
@@ -354,9 +503,7 @@ impl ThreadedFileEngine {
     pub fn drain(&mut self, discard: bool) -> Result<(), ThreadedIoError> {
         if self.in_flight > 0 {
             let (ack, done) = mpsc::sync_channel(1);
-            self.ops
-                .send(Op::Barrier(ack))
-                .map_err(|_| ThreadedIoError::WorkerGone)?;
+            self.send(Op::Barrier(ack))?;
             done.recv().map_err(|_| ThreadedIoError::WorkerGone)?;
         }
 
@@ -372,16 +519,14 @@ impl ThreadedFileEngine {
 
         // Sync data out to physical media on host. The worker holds no data of its own, so the
         // file descriptor here reaches everything it wrote.
-        self.file
-            .sync_all()
-            .map_err(|err| ThreadedIoError::Io(SyncIoError::SyncAll(err)))
+        self.file.sync_all().map_err(ThreadedIoError::SyncAll)
     }
 }
 
 impl Drop for ThreadedFileEngine {
     fn drop(&mut self) {
         // The worker only exits once it gets here, so everything submitted before is finished.
-        let _ = self.ops.send(Op::Exit);
+        let _ = self.send(Op::Exit);
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
@@ -403,7 +548,7 @@ mod tests {
     use crate::utils::u64_to_usize;
     use crate::vmm_config::machine_config::HugePageConfig;
     use crate::vstate::memory;
-    use crate::vstate::memory::{Bitmap, Bytes, GuestMemory, GuestRegionMmapExt};
+    use crate::vstate::memory::{Bitmap, Bytes, GuestRegionMmapExt};
 
     const FILE_LEN: u32 = 1024;
     // 2 pages of memory should be enough to test read/write ops and also dirty tracking.
@@ -518,12 +663,111 @@ mod tests {
         engine.drain(false).unwrap();
         assert!(matches!(
             engine.pop().unwrap().result,
-            Err(ThreadedIoError::Io(SyncIoError::Transfer(_)))
+            Err(ThreadedIoError::GuestMemory(_))
         ));
 
         engine.push_flush(PendingRequest::default()).unwrap();
         assert_completed(&mut engine, 0);
         engine.drain_and_flush(true).unwrap();
+    }
+
+    #[test]
+    fn test_vectored() {
+        let mut engine = new_engine();
+        let data = vmm_sys_util::rand::rand_alphanumerics(3072)
+            .as_bytes()
+            .to_vec();
+
+        // Write three buffers that are neither adjacent nor in order in guest memory.
+        let mem = create_mem();
+        let segments = vec![
+            (GuestAddress(4096), 1024),
+            (GuestAddress(0), 512),
+            (GuestAddress(2048), 1536),
+        ];
+        mem.write_slice(&data[..1024], GuestAddress(4096)).unwrap();
+        mem.write_slice(&data[1024..1536], GuestAddress(0)).unwrap();
+        mem.write_slice(&data[1536..], GuestAddress(2048)).unwrap();
+        engine
+            .push_writev(512, &mem, segments, PendingRequest::default())
+            .unwrap();
+        assert_completed(&mut engine, 3072);
+
+        // Read them back into different buffers, both in the first page.
+        let mem = create_mem();
+        let segments = vec![(GuestAddress(1024), 2048), (GuestAddress(0), 1024)];
+        engine
+            .push_readv(512, &mem, segments, PendingRequest::default())
+            .unwrap();
+        assert_completed(&mut engine, 3072);
+        let mut buf = vec![0u8; 3072];
+        mem.read_slice(&mut buf[..2048], GuestAddress(1024))
+            .unwrap();
+        mem.read_slice(&mut buf[2048..], GuestAddress(0)).unwrap();
+        assert_eq!(buf, data);
+
+        // The page read into is dirty, the other one is not.
+        check_dirty_mem(&mem, GuestAddress(0), 4096, true);
+        check_dirty_mem(&mem, GuestAddress(4096), 4096, false);
+
+        // One bad buffer fails the whole request, before any of it is transferred.
+        let mem = create_mem();
+        let segments = vec![(GuestAddress(0), 512), (GuestAddress(MEM_LEN as u64), 512)];
+        engine
+            .push_readv(512, &mem, segments, PendingRequest::default())
+            .unwrap();
+        engine.drain(false).unwrap();
+        assert!(matches!(
+            engine.pop().unwrap().result,
+            Err(ThreadedIoError::GuestMemory(_))
+        ));
+        check_dirty_mem(&mem, GuestAddress(0), 512, false);
+
+        // Reading past the end of the file is an error, not a short read.
+        let mem = create_mem();
+        engine
+            .push_read(3072, &mem, GuestAddress(0), 1024, PendingRequest::default())
+            .unwrap();
+        engine.drain(false).unwrap();
+        assert!(matches!(
+            engine.pop().unwrap().result,
+            Err(ThreadedIoError::Read(_))
+        ));
+    }
+
+    #[test]
+    fn test_batching() {
+        let mem = create_mem();
+        let mut engine = new_engine();
+
+        // Nothing reaches the worker until the kick.
+        for _ in 0..4 {
+            engine
+                .push_write(
+                    0,
+                    &mem,
+                    GuestAddress(0),
+                    FILE_LEN,
+                    PendingRequest::default(),
+                )
+                .unwrap();
+        }
+        thread::sleep(Duration::from_millis(50));
+        engine.completion_evt().read().unwrap_err();
+        assert!(engine.pop().is_none());
+
+        engine.kick().unwrap();
+        let mut completed = 0;
+        while completed < 4 {
+            wait_for_signal(&engine);
+            while let Some(completion) = engine.pop() {
+                assert_eq!(completion.result.unwrap(), FILE_LEN);
+                completed += 1;
+            }
+        }
+        // A kick with nothing pushed is a no-op.
+        engine.kick().unwrap();
+        assert!(engine.pop().is_none());
     }
 
     #[test]
@@ -544,6 +788,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        engine.kick().unwrap();
         let mut completed = 0;
         while completed < 10 {
             wait_for_signal(&engine);

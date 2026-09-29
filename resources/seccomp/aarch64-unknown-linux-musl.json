@@ -1255,6 +1255,14 @@
             {
                 "syscall": "restart_syscall",
                 "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
+            },
+            {
+                "syscall": "preadv",
+                "comment": "Reads from the backing file, into the buffers of a request"
+            },
+            {
+                "syscall": "pwritev",
+                "comment": "Writes to the backing file, from the buffers of a request"
             }
         ]
     }
