@@ -62,6 +62,8 @@ pub enum VirtioBlockError {
     DiscardAsyncUnsupported,
     /// Discard is not supported with read-only drives.
     DiscardReadOnlyUnsupported,
+    /// Guest gave us more data descriptors than the device allows.
+    TooManySegments,
     /// Guest gave us a read only descriptor that protocol says to write to.
     UnexpectedReadOnlyDescriptor,
     /// Guest gave us a write only descriptor that protocol says to read from.
