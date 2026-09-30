@@ -42,6 +42,7 @@ serde_json = "1.0.145"
 [dev-dependencies]
 cargo_toml = "0.22.3"
 libc = "0.2.177"
+seccompiler = { path = "../seccompiler" }
 regex = { version = "1.12.2", default-features = false, features = [
   "std",
   "unicode-perl",
