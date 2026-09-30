@@ -314,6 +314,8 @@ impl VirtioBlock {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
         };
 
+        avail_features |= Self::threaded_features(config.file_engine_type);
+
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
 
         let queues = BLOCK_QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
@@ -634,6 +636,9 @@ impl VirtioDevice for VirtioBlock {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
+        if self.threaded_read_config(offset, data) {
+            return;
+        }
         if let Some(config_space_bytes) = self.config_space.as_slice().get(u64_to_usize(offset)..) {
             let len = config_space_bytes.len().min(data.len());
             data[..len].copy_from_slice(&config_space_bytes[..len]);

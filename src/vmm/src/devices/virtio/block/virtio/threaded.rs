@@ -1,20 +1,172 @@
 // Copyright 2026 Fly.io, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Block device support for the threaded IO engine: handing the queue to the engine's worker
-//! thread, which serves it from activation on.
+//! Block device support for the threaded IO engine: requests with several data buffers, and
+//! handing the queue to the engine's worker thread, which serves it from activation on.
+
+use vm_memory::ByteValued;
 
 use std::os::unix::io::AsRawFd;
 
-use super::device::VirtioBlock;
+use super::device::{FileEngineType, VirtioBlock};
 use super::io::FileEngine;
-use super::io::threaded_io::Serving;
+use super::io::threaded_io::{Serving, THREADED_SEG_MAX};
+use super::request::{Request, RequestType};
+use super::{SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError};
 use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_SEG_MAX;
+use crate::devices::virtio::queue::DescriptorChain;
 use crate::logger::{IncMetric, error};
 use crate::rate_limiter::BucketUpdate;
+use crate::utils::u64_to_usize;
 use crate::vmm_config::RateLimiterConfig;
+use crate::vstate::memory::GuestMemoryMmap;
+
+/// The start of `struct virtio_blk_config`, up to `seg_max`. The device's own config space ends
+/// after `capacity`.
+#[derive(Debug, Default, Clone, Copy)]
+#[repr(C)]
+struct SegmentedConfigSpace {
+    capacity: u64,
+    size_max: u32,
+    seg_max: u32,
+}
+
+// SAFETY: `SegmentedConfigSpace` contains only PODs in `repr(C)`, without padding.
+unsafe impl ByteValued for SegmentedConfigSpace {}
+
+impl Request {
+    /// Parse a request, with any number of data buffers if `segmented`.
+    pub fn parse_any(
+        avail_desc: &DescriptorChain,
+        mem: &GuestMemoryMmap,
+        num_disk_sectors: u64,
+        segmented: bool,
+    ) -> Result<Request, VirtioBlockError> {
+        if segmented {
+            Self::parse_segmented(avail_desc, mem, num_disk_sectors)
+        } else {
+            Self::parse(avail_desc, mem, num_disk_sectors)
+        }
+    }
+
+    /// Parse a request whose data may come in several buffers: every descriptor between the
+    /// header and the status is one. Requests that are not reads or writes are left to `parse`.
+    pub fn parse_segmented(
+        avail_desc: &DescriptorChain,
+        mem: &GuestMemoryMmap,
+        num_disk_sectors: u64,
+    ) -> Result<Request, VirtioBlockError> {
+        // The head contains the request type which MUST be readable.
+        if avail_desc.is_write_only() {
+            return Err(VirtioBlockError::UnexpectedWriteOnlyDescriptor);
+        }
+        let header: super::RequestHeader = {
+            use crate::vstate::memory::Bytes;
+            mem.read_obj(avail_desc.addr)
+                .map_err(VirtioBlockError::GuestMemory)?
+        };
+        let (r#type, sector) = header.type_and_sector();
+        if r#type != RequestType::In && r#type != RequestType::Out {
+            return Self::parse(avail_desc, mem, num_disk_sectors);
+        }
+
+        let mut segments = Vec::new();
+        let mut data_len: u32 = 0;
+        let mut desc = avail_desc
+            .next_descriptor()
+            .ok_or(VirtioBlockError::DescriptorChainTooShort)?;
+        // The last descriptor is the status, the ones before it are data.
+        while let Some(next) = desc.next_descriptor() {
+            // This also bounds the walk, should the chain loop.
+            if segments.len() >= u64_to_usize(u64::from(THREADED_SEG_MAX)) {
+                return Err(VirtioBlockError::TooManySegments);
+            }
+            if desc.is_write_only() && r#type == RequestType::Out {
+                return Err(VirtioBlockError::UnexpectedWriteOnlyDescriptor);
+            }
+            if !desc.is_write_only() && r#type == RequestType::In {
+                return Err(VirtioBlockError::UnexpectedReadOnlyDescriptor);
+            }
+            data_len = data_len
+                .checked_add(desc.len)
+                .ok_or(VirtioBlockError::InvalidDataLength)?;
+            segments.push((desc.addr, desc.len));
+            desc = next;
+        }
+        let status_desc = desc;
+        if segments.is_empty() {
+            return Err(VirtioBlockError::DescriptorChainTooShort);
+        }
+
+        // Check that the data length is a multiple of 512 as specified in the virtio standard.
+        if data_len % SECTOR_SIZE != 0 {
+            return Err(VirtioBlockError::InvalidDataLength);
+        }
+        let top_sector = sector
+            .checked_add(u64::from(data_len) >> SECTOR_SHIFT)
+            .ok_or(VirtioBlockError::InvalidOffset)?;
+        if top_sector > num_disk_sectors {
+            return Err(VirtioBlockError::InvalidOffset);
+        }
+
+        // The status MUST always be writable.
+        if !status_desc.is_write_only() {
+            return Err(VirtioBlockError::UnexpectedReadOnlyDescriptor);
+        }
+        if status_desc.len < 1 {
+            return Err(VirtioBlockError::DescriptorLengthTooSmall);
+        }
+
+        Ok(Request {
+            r#type,
+            data_len,
+            status_addr: status_desc.addr,
+            sector,
+            data_addr: segments[0].0,
+            segments,
+        })
+    }
+}
 
 impl VirtioBlock {
+    /// Features only the threaded engine offers.
+    pub(super) fn threaded_features(engine_type: FileEngineType) -> u64 {
+        match engine_type {
+            FileEngineType::Threaded => 1u64 << VIRTIO_BLK_F_SEG_MAX,
+            _ => 0,
+        }
+    }
+
+    /// Whether requests may have several data buffers. Decided by what the device offered, not
+    /// by what the driver accepted: a driver that did not accept it sends one buffer anyway.
+    pub(super) fn accepts_segments(&self) -> bool {
+        self.avail_features & (1u64 << VIRTIO_BLK_F_SEG_MAX) != 0
+            && matches!(self.disk.file_engine, FileEngine::Threaded(_))
+    }
+
+    /// Serve a config space read from the longer config space of a device that takes several
+    /// data buffers per request. Returns false if this device does not.
+    pub(super) fn threaded_read_config(&self, offset: u64, data: &mut [u8]) -> bool {
+        if !self.accepts_segments() {
+            return false;
+        }
+
+        let config_space = SegmentedConfigSpace {
+            capacity: self.config_space.capacity,
+            size_max: 0,
+            seg_max: THREADED_SEG_MAX.to_le(),
+        };
+        if let Some(bytes) = config_space.as_slice().get(u64_to_usize(offset)..) {
+            let len = bytes.len().min(data.len());
+            data[..len].copy_from_slice(&bytes[..len]);
+        } else {
+            error!("Failed to read config space");
+            self.metrics.cfg_fails.inc();
+        }
+        true
+    }
+
     /// Hand the queue to the worker, which serves it from then on. Called once the device is
     /// activated, and again after `threaded_stop`, when the device is kicked.
     pub(super) fn threaded_start(&mut self) {
@@ -37,6 +189,7 @@ impl VirtioBlock {
             metrics: self.metrics.clone(),
             nsectors: self.disk.nsectors,
             image_id: self.disk.image_id,
+            segmented: self.accepts_segments(),
             drive_id: self.id.clone(),
         };
         let FileEngine::Threaded(engine) = &mut self.disk.file_engine else {
@@ -123,7 +276,7 @@ mod tests {
 
     use super::*;
     use crate::devices::virtio::block::persist::BlockConstructorArgs;
-    use crate::devices::virtio::block::virtio::device::{FileEngineType, VirtioBlockConfig};
+    use crate::devices::virtio::block::virtio::device::VirtioBlockConfig;
     use crate::devices::virtio::block::virtio::test_utils::{default_block, set_queue};
     use crate::devices::virtio::block::virtio::{
         CacheType, RequestHeader, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN,
@@ -134,7 +287,7 @@ mod tests {
     use crate::devices::virtio::transport::VirtioInterruptType;
     use crate::rate_limiter::RateLimiter;
     use crate::snapshot::Persist;
-    use crate::vstate::memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+    use crate::vstate::memory::{Address, Bytes, GuestAddress};
 
     fn add_flush_requests_batch(block: &mut VirtioBlock, vq: &VirtQueue, count: u16) {
         let mem = vq.memory();
@@ -231,7 +384,7 @@ mod tests {
         assert_eq!(block.config().file_engine_type, FileEngineType::Threaded);
     }
 
-    /// Chain a header, the data buffers and a status, from descriptor 0 on.
+    /// Chain a header, `segments` data buffers and a status, from descriptor 0 on.
     fn set_request(
         vq: &VirtQueue,
         request_type: u32,
@@ -266,6 +419,35 @@ mod tests {
     }
 
     #[test]
+    fn test_features_and_config_space() {
+        let block = default_block(FileEngineType::Threaded);
+        assert_ne!(block.avail_features() & (1 << VIRTIO_BLK_F_SEG_MAX), 0);
+        assert!(block.accepts_segments());
+
+        // capacity (8 sectors), size_max, seg_max
+        let mut config = [0xffu8; 16];
+        block.read_config(0, &mut config);
+        assert_eq!(config[..8], 8u64.to_le_bytes());
+        assert_eq!(config[8..12], 0u32.to_le_bytes());
+        assert_eq!(config[12..], THREADED_SEG_MAX.to_le_bytes());
+        // Partial reads, as the guest does them.
+        let mut seg_max = [0u8; 4];
+        block.read_config(12, &mut seg_max);
+        assert_eq!(seg_max, THREADED_SEG_MAX.to_le_bytes());
+
+        // The other engines offer neither the feature nor the longer config space.
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let block = default_block(engine);
+            assert_eq!(block.avail_features() & (1 << VIRTIO_BLK_F_SEG_MAX), 0);
+            assert!(!block.accepts_segments());
+            let mut config = [0xffu8; 16];
+            block.read_config(0, &mut config);
+            assert_eq!(config[..8], 8u64.to_le_bytes());
+            assert_eq!(config[8..], [0xff; 8]);
+        }
+    }
+
+    #[test]
     fn test_read_write() {
         let mut block = default_block(FileEngineType::Threaded);
         let mem = default_mem();
@@ -273,10 +455,19 @@ mod tests {
         set_queue(&mut block, 0, vq.create_queue());
         serve(&mut block, &mem);
 
-        // The backing file is 8 sectors. Write 4 of them.
+        // The backing file is 8 sectors. Write 4 of them from three scattered buffers.
         let data: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
-        mem.write_slice(&data, GuestAddress(0x2000)).unwrap();
-        let status_addr = set_request(&vq, VIRTIO_BLK_T_OUT, 2, &[(0x2000, 2048)]);
+        mem.write_slice(&data[..512], GuestAddress(0x4000)).unwrap();
+        mem.write_slice(&data[512..1536], GuestAddress(0x2000))
+            .unwrap();
+        mem.write_slice(&data[1536..], GuestAddress(0x6000))
+            .unwrap();
+        let status_addr = set_request(
+            &vq,
+            VIRTIO_BLK_T_OUT,
+            2,
+            &[(0x4000, 512), (0x2000, 1024), (0x6000, 512)],
+        );
         // The worker serves the queue from the guest's notification, without the event loop.
         notify(&block);
         wait_for("the write", || vq.used.idx.get() == 1);
@@ -288,8 +479,8 @@ mod tests {
             VIRTIO_BLK_S_OK
         );
 
-        // Read them back.
-        let status_addr = set_request(&vq, VIRTIO_BLK_T_IN, 2, &[(0x8000, 2048)]);
+        // Read them back as two buffers.
+        let status_addr = set_request(&vq, VIRTIO_BLK_T_IN, 2, &[(0x8000, 1536), (0xa000, 512)]);
         vq.avail.ring[1].set(0);
         vq.avail.idx.set(2);
         vq.used.idx.set(1);
@@ -301,7 +492,10 @@ mod tests {
             VIRTIO_BLK_S_OK
         );
         let mut buf = vec![0u8; 2048];
-        mem.read_slice(&mut buf, GuestAddress(0x8000)).unwrap();
+        mem.read_slice(&mut buf[..1536], GuestAddress(0x8000))
+            .unwrap();
+        mem.read_slice(&mut buf[1536..], GuestAddress(0xa000))
+            .unwrap();
         assert_eq!(buf, data);
     }
 
@@ -461,6 +655,58 @@ mod tests {
         serve(&mut block, &mem);
         wait_for("the first flush", || vq.used.idx.get() == 1);
         drop(block);
+    }
+
+    #[test]
+    fn test_segmented_parse_failures() {
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 64);
+        let parse = |request_type, sector, segments: &[(u64, u32)]| {
+            set_request(&vq, request_type, sector, segments);
+            let mut queue = vq.create_queue();
+            let head = queue.pop().unwrap().unwrap();
+            Request::parse_segmented(&head, &mem, 8)
+        };
+
+        // As many buffers as advertised, but no more.
+        let max = usize::try_from(THREADED_SEG_MAX).unwrap();
+        let segments: Vec<(u64, u32)> = (0..=max).map(|i| (0x2000 + 512 * i as u64, 0)).collect();
+        let request = parse(VIRTIO_BLK_T_OUT, 0, &segments[..max]).unwrap();
+        assert_eq!(request.segments.len(), max);
+        assert!(matches!(
+            parse(VIRTIO_BLK_T_OUT, 0, &segments),
+            Err(VirtioBlockError::TooManySegments)
+        ));
+
+        // The total length counts: a multiple of the sector size, within the disk.
+        parse(VIRTIO_BLK_T_OUT, 0, &[(0x2000, 256), (0x3000, 256)]).unwrap();
+        assert!(matches!(
+            parse(VIRTIO_BLK_T_OUT, 0, &[(0x2000, 512), (0x3000, 256)]),
+            Err(VirtioBlockError::InvalidDataLength)
+        ));
+        assert!(matches!(
+            parse(VIRTIO_BLK_T_OUT, 6, &[(0x2000, 512), (0x3000, 1024)]),
+            Err(VirtioBlockError::InvalidOffset)
+        ));
+        assert!(matches!(
+            parse(VIRTIO_BLK_T_OUT, 0, &[(0x2000, u32::MAX), (0x3000, 512)]),
+            Err(VirtioBlockError::InvalidDataLength)
+        ));
+        // No data at all.
+        assert!(matches!(
+            parse(VIRTIO_BLK_T_IN, 0, &[]),
+            Err(VirtioBlockError::DescriptorChainTooShort)
+        ));
+
+        // Every buffer has to have the direction of the request.
+        set_request(&vq, VIRTIO_BLK_T_IN, 0, &[(0x2000, 512), (0x3000, 512)]);
+        vq.dtable[2].flags.set(VIRTQ_DESC_F_NEXT);
+        let mut queue = vq.create_queue();
+        let head = queue.pop().unwrap().unwrap();
+        assert!(matches!(
+            Request::parse_segmented(&head, &mem, 8),
+            Err(VirtioBlockError::UnexpectedReadOnlyDescriptor)
+        ));
     }
 
     #[test]

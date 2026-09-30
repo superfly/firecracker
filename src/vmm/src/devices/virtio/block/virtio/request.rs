@@ -208,6 +208,10 @@ pub struct RequestHeader {
 unsafe impl ByteValued for RequestHeader {}
 
 impl RequestHeader {
+    pub(super) fn type_and_sector(&self) -> (RequestType, u64) {
+        (RequestType::from(self.request_type), self.sector)
+    }
+
     pub fn new(request_type: u32, sector: u64) -> RequestHeader {
         RequestHeader {
             request_type,
@@ -238,6 +242,8 @@ pub struct Request {
     pub status_addr: GuestAddress,
     pub(super) sector: u64,
     pub(super) data_addr: GuestAddress,
+    /// The data buffers of a request parsed with `parse_segmented`, `data_len` bytes in total.
+    pub(super) segments: Vec<(GuestAddress, u32)>,
 }
 
 impl Request {
@@ -258,6 +264,7 @@ impl Request {
             data_addr: GuestAddress(0),
             data_len: 0,
             status_addr: GuestAddress(0),
+            segments: Vec::new(),
         };
 
         let data_desc;
@@ -834,6 +841,7 @@ mod tests {
             status_addr,
             sector: sector & (NUM_DISK_SECTORS - sectors_len),
             data_addr,
+            segments: Vec::new(),
         };
         let mut request_header = RequestHeader::new(virtio_request_id, request.sector);
 

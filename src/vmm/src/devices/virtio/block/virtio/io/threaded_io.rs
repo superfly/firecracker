@@ -10,7 +10,8 @@
 //! every other device serviced there, and no io_uring support is needed.
 //!
 //! The event loop only sends the worker control messages: start and stop serving the queue, kick
-//! it, swap the backing file, and wait for it.
+//! it, swap the backing file, and wait for it. Requests carry up to [`THREADED_SEG_MAX`] guest
+//! buffers each.
 
 use std::fs::File;
 use std::mem::ManuallyDrop;
@@ -35,6 +36,13 @@ use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::vstate::memory::{
     Bytes, GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap,
 };
+
+/// Maximum number of data buffers in one request, advertised to the guest as `seg_max`.
+///
+/// Without it a guest must send one request per physically contiguous buffer, which for page
+/// cache writeback means one per 4 KiB page. Indirect descriptors are not supported, so a
+/// request takes this many entries of the 256-entry queue, plus two.
+pub const THREADED_SEG_MAX: u32 = 32;
 
 /// A guest buffer: its address and length.
 pub type Segment = (GuestAddress, u32);
@@ -192,6 +200,8 @@ pub struct Serving {
     pub metrics: Arc<BlockDeviceMetrics>,
     pub nsectors: u64,
     pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    /// Whether requests may carry several data buffers.
+    pub segmented: bool,
     pub drive_id: String,
 }
 
@@ -234,6 +244,7 @@ struct Active {
     metrics: Arc<BlockDeviceMetrics>,
     nsectors: u64,
     image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    segmented: bool,
 }
 
 #[derive(Debug)]
@@ -351,6 +362,7 @@ impl Worker {
             metrics: serving.metrics,
             nsectors: serving.nsectors,
             image_id: serving.image_id,
+            segmented: serving.segmented,
         });
         // Serve what the guest queued before the worker was watching.
         self.process_queue();
@@ -422,7 +434,7 @@ impl Worker {
                 .remaining_reqs_count
                 .add(active.queue.len().into());
 
-            let parsed = Request::parse(&head, &active.mem, active.nsectors);
+            let parsed = Request::parse_any(&head, &active.mem, active.nsectors, active.segmented);
             let finished = match parsed {
                 Ok(request) => {
                     let limited = request.rate_limit(
@@ -478,14 +490,18 @@ impl Worker {
 
 /// Perform a request with blocking IO, write its status, and return what to put in the used
 /// ring.
-fn execute(file: &File, active: &Active, request: Request, desc_idx: u16) -> FinishedRequest {
+fn execute(file: &File, active: &Active, mut request: Request, desc_idx: u16) -> FinishedRequest {
     let (mem, metrics) = (&active.mem, &*active.metrics);
     let pending = request.to_pending_request(desc_idx);
     let file_error = |err| IoErr::FileEngine(BlockIoError::Threaded(err));
 
     let result = match request.r#type {
         RequestType::In | RequestType::Out => {
-            let segments = [(request.data_addr, request.data_len)];
+            let segments = if request.segments.is_empty() {
+                vec![(request.data_addr, request.data_len)]
+            } else {
+                std::mem::take(&mut request.segments)
+            };
             let offset = request.sector << SECTOR_SHIFT;
             if request.r#type == RequestType::In {
                 let _metric = metrics.read_agg.record_latency_metrics();
