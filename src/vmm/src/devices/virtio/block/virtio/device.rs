@@ -484,6 +484,9 @@ impl VirtioBlock {
             }
         }
 
+        avail_features |= Self::threaded_features(config.file_engine_type);
+        config_space.seg_max = Self::threaded_seg_max(avail_features).to_le();
+
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
 
         let queues = BLOCK_QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();

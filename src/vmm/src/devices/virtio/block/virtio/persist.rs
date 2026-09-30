@@ -127,6 +127,7 @@ impl Persist<'_> for VirtioBlock {
             blk_size: state.blk_size,
             topology: state.topology,
             discard_sector_alignment: state.discard_sector_alignment,
+            seg_max: VirtioBlock::threaded_seg_max(avail_features).to_le(),
             ..Default::default()
         };
 
