@@ -512,6 +512,19 @@ mod tests {
     }
 
     #[test]
+    fn test_start_interrupts() {
+        let mut block = default_block(FileEngineType::Threaded);
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        // Nothing queued, as after a restore whose last completion's interrupt was lost: the
+        // worker interrupts the guest anyway when it starts serving.
+        serve(&mut block, &mem);
+        wait_for("the interrupt", || interrupted(&block));
+        assert_eq!(vq.used.idx.get(), 0);
+    }
+
+    #[test]
     fn test_rate_limiter() {
         let mut block = default_block(FileEngineType::Threaded);
         let mem = default_mem();

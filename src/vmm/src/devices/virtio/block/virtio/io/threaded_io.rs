@@ -366,6 +366,18 @@ impl Worker {
         });
         // Serve what the guest queued before the worker was watching.
         self.process_queue();
+        // Then interrupt the guest whether or not that served anything. A request this worker
+        // completed while the VM was being snapshotted reached the used ring, which is saved
+        // with guest memory, after the vCPUs, the irqchip and the transport were saved. Its
+        // interrupt is lost on restore, and with VIRTIO_RING_F_EVENT_IDX the guest's used_event
+        // then stays behind and suppresses every later one: the guest never sees a completion
+        // again. A spurious interrupt is harmless.
+        if let Some(active) = self.active.as_ref() {
+            active
+                .interrupt
+                .trigger(VirtioInterruptType::Queue(0))
+                .unwrap_or_else(|_| active.metrics.event_fails.inc());
+        }
     }
 
     /// Stop serving the queue, and return it.
