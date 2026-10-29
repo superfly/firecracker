@@ -1,3 +1,6 @@
+# Fly.io owners first; upstream entries below are kept for reference.
+* @superfly/machines-team
+
 # All markdown files
 *.md @xmarcalx @kalyazin @pb8o @Manciukic
 
