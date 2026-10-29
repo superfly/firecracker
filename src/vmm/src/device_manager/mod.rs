@@ -21,6 +21,7 @@ use pci_mngr::{PciDevices, PciDevicesConstructorArgs, PciManagerError};
 use persist::MMIODevManagerConstructorArgs;
 use serde::{Deserialize, Serialize};
 use utils::time::TimestampUs;
+use vm_superio::serial;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::device_manager::acpi::ACPIDeviceError;
@@ -28,8 +29,8 @@ use crate::device_manager::acpi::ACPIDeviceError;
 use crate::devices::legacy::I8042Device;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::RTCDevice;
+use crate::devices::legacy::SerialDevice;
 use crate::devices::legacy::serial::SerialOut;
-use crate::devices::legacy::{IER_RDA_BIT, IER_RDA_OFFSET, SerialDevice};
 use crate::devices::pseudo::BootTimer;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::transport::mmio::{IrqTrigger, MmioTransport};
@@ -38,7 +39,7 @@ use crate::snapshot::Persist;
 use crate::utils::open_file_nonblock;
 use crate::vstate::bus::BusError;
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::{EmulateSerialInitError, EventManager, Vm};
+use crate::{EventManager, Vm};
 
 /// ACPI device manager.
 pub mod acpi;
@@ -123,6 +124,7 @@ impl DeviceManager {
     fn setup_serial_device(
         event_manager: &mut EventManager,
         output: Option<&PathBuf>,
+        state: Option<&serial::SerialState>,
     ) -> Result<Arc<Mutex<SerialDevice>>, std::io::Error> {
         let (serial_in, serial_out) = match output {
             Some(path) => (None, open_file_nonblock(path).map(SerialOut::File)?),
@@ -133,9 +135,32 @@ impl DeviceManager {
             }
         };
 
-        let serial = Arc::new(Mutex::new(SerialDevice::new(serial_in, serial_out)?));
+        let serial = Arc::new(Mutex::new(SerialDevice::new(serial_in, serial_out, state)?));
         event_manager.add_subscriber(serial.clone());
         Ok(serial)
+    }
+
+    fn serial_state(&self) -> Option<persist::SerialState> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.mmio_devices.serial.as_ref().map(|device| {
+                let locked = device.inner.lock().expect("Poisoned lock");
+                locked.serial.state().into()
+            })
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            Some(
+                self.legacy_devices
+                    .stdio_serial
+                    .lock()
+                    .expect("Poisoned lock")
+                    .serial
+                    .state()
+                    .into(),
+            )
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -144,9 +169,10 @@ impl DeviceManager {
         vcpus_exit_evt: &EventFd,
         vm: &Vm,
         serial_output: Option<&PathBuf>,
+        serial_state: Option<&serial::SerialState>,
     ) -> Result<PortIODeviceManager, DeviceManagerCreateError> {
         // Create serial device
-        let serial = Self::setup_serial_device(event_manager, serial_output)?;
+        let serial = Self::setup_serial_device(event_manager, serial_output, serial_state)?;
         let reset_evt = vcpus_exit_evt
             .try_clone()
             .map_err(DeviceManagerCreateError::EventFd)?;
@@ -168,7 +194,7 @@ impl DeviceManager {
     ) -> Result<Self, DeviceManagerCreateError> {
         #[cfg(target_arch = "x86_64")]
         let legacy_devices =
-            Self::create_legacy_devices(event_manager, vcpus_exit_evt, vm, serial_output)?;
+            Self::create_legacy_devices(event_manager, vcpus_exit_evt, vm, serial_output, None)?;
 
         Ok(DeviceManager {
             mmio_devices: MMIODeviceManager::new(),
@@ -260,7 +286,7 @@ impl DeviceManager {
             .contains("console=");
 
         if cmdline_contains_console {
-            let serial = Self::setup_serial_device(event_manager, serial_out_path)?;
+            let serial = Self::setup_serial_device(event_manager, serial_out_path, None)?;
             self.mmio_devices.register_mmio_serial(vm, serial, None)?;
             self.mmio_devices.add_mmio_serial_to_cmdline(cmdline)?;
         }
@@ -386,6 +412,8 @@ pub struct DevicesState {
     pub acpi_state: persist::ACPIDeviceManagerState,
     /// PCI devices state
     pub pci_state: pci_mngr::PciDevicesState,
+    /// Serial device state
+    pub serial_state: Option<persist::SerialState>,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -398,8 +426,6 @@ pub enum DevicePersistError {
     PciRestore(#[from] PciManagerError),
     /// Error notifying VMGenID device: {0}
     VmGenidUpdate(#[from] std::io::Error),
-    /// Error resetting serial console: {0}
-    SerialRestore(#[from] EmulateSerialInitError),
     /// Error inserting device in bus: {0}
     Bus(#[from] BusError),
     /// Error creating DeviceManager: {0}
@@ -436,6 +462,7 @@ impl<'a> Persist<'a> for DeviceManager {
             mmio_state: self.mmio_devices.save(),
             acpi_state: self.acpi_devices.save(),
             pci_state: self.pci_devices.save(),
+            serial_state: self.serial_state(),
         }
     }
 
@@ -445,11 +472,15 @@ impl<'a> Persist<'a> for DeviceManager {
     ) -> Result<Self, Self::Error> {
         // Setup legacy devices in case of x86
         #[cfg(target_arch = "x86_64")]
+        let serial_state: Option<vm_superio::serial::SerialState> =
+            state.serial_state.as_ref().map(Into::into);
+        #[cfg(target_arch = "x86_64")]
         let legacy_devices = Self::create_legacy_devices(
             constructor_args.event_manager,
             constructor_args.vcpus_exit_evt,
             constructor_args.vm,
             constructor_args.vm_resources.serial_out_path.as_ref(),
+            serial_state.as_ref(),
         )?;
 
         // Restore MMIO devices
@@ -459,6 +490,7 @@ impl<'a> Persist<'a> for DeviceManager {
             event_manager: constructor_args.event_manager,
             vm_resources: constructor_args.vm_resources,
             instance_id: constructor_args.instance_id,
+            serial_state: state.serial_state.as_ref(),
         };
         let mmio_devices = MMIODeviceManager::restore(mmio_ctor_args, &state.mmio_state)?;
 
@@ -476,59 +508,13 @@ impl<'a> Persist<'a> for DeviceManager {
         };
         let pci_devices = PciDevices::restore(pci_ctor_args, &state.pci_state)?;
 
-        let device_manager = DeviceManager {
+        Ok(DeviceManager {
             mmio_devices,
             #[cfg(target_arch = "x86_64")]
             legacy_devices,
             acpi_devices,
             pci_devices,
-        };
-
-        // Restore serial.
-        // We need to do that after we restore mmio devices, otherwise it won't succeed in Aarch64
-        device_manager.emulate_serial_init()?;
-
-        Ok(device_manager)
-    }
-}
-
-impl DeviceManager {
-    /// Sets RDA bit in serial console
-    pub fn emulate_serial_init(&self) -> Result<(), EmulateSerialInitError> {
-        // When restoring from a previously saved state, there is no serial
-        // driver initialization, therefore the RDA (Received Data Available)
-        // interrupt is not enabled. Because of that, the driver won't get
-        // notified of any bytes that we send to the guest. The clean solution
-        // would be to save the whole serial device state when we do the vm
-        // serialization. For now we set that bit manually
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            if let Some(device) = &self.mmio_devices.serial {
-                let mut device_locked = device.inner.lock().expect("Poisoned lock");
-
-                device_locked
-                    .serial
-                    .write(IER_RDA_OFFSET, IER_RDA_BIT)
-                    .map_err(|_| EmulateSerialInitError(std::io::Error::last_os_error()))?;
-            }
-            Ok(())
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            let mut serial = self
-                .legacy_devices
-                .stdio_serial
-                .lock()
-                .expect("Poisoned lock");
-
-            serial
-                .serial
-                .write(IER_RDA_OFFSET, IER_RDA_BIT)
-                .map_err(|_| EmulateSerialInitError(std::io::Error::last_os_error()))?;
-            Ok(())
-        }
+        })
     }
 }
 
@@ -548,7 +534,7 @@ pub(crate) mod tests {
         #[cfg(target_arch = "x86_64")]
         let legacy_devices = PortIODeviceManager::new(
             Arc::new(Mutex::new(
-                SerialDevice::new(None, SerialOut::Sink).unwrap(),
+                SerialDevice::new(None, SerialOut::Sink, None).unwrap(),
             )),
             Arc::new(Mutex::new(
                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),
