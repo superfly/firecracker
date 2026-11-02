@@ -2,17 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod async_io;
+pub mod nbd_io;
 pub mod sync_io;
 pub mod threaded_io;
 
 use std::fmt::Debug;
 use std::fs::File;
+use std::sync::{Arc, Mutex};
 
 pub use self::async_io::{AsyncFileEngine, AsyncIoError};
+pub use self::nbd_io::{NbdBackendConfig, NbdFileEngine, NbdIoError};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
 pub use self::threaded_io::{ThreadedFileEngine, ThreadedIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
+use crate::devices::virtio::queue::Queue;
+use crate::rate_limiter::{BucketUpdate, RateLimiter};
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 #[derive(Debug)]
@@ -35,6 +40,8 @@ pub enum BlockIoError {
     Async(AsyncIoError),
     /// Threaded error: {0}
     Threaded(ThreadedIoError),
+    /// NBD error: {0}
+    Nbd(NbdIoError),
 }
 
 impl BlockIoError {
@@ -59,6 +66,7 @@ pub enum FileEngine {
     Async(AsyncFileEngine),
     Sync(SyncFileEngine),
     Threaded(ThreadedFileEngine),
+    Nbd(NbdFileEngine),
 }
 
 impl FileEngine {
@@ -71,6 +79,7 @@ impl FileEngine {
             FileEngineType::Threaded => Ok(FileEngine::Threaded(
                 ThreadedFileEngine::from_file(file).map_err(BlockIoError::Threaded)?,
             )),
+            FileEngineType::Nbd => Err(BlockIoError::Nbd(NbdIoError::NoBackingFile)),
         }
     }
 
@@ -81,6 +90,7 @@ impl FileEngine {
             FileEngine::Threaded(engine) => {
                 engine.update_file(file).map_err(BlockIoError::Threaded)?
             }
+            FileEngine::Nbd(engine) => engine.update_file(file).map_err(BlockIoError::Nbd)?,
         };
 
         Ok(())
@@ -92,6 +102,7 @@ impl FileEngine {
             FileEngine::Async(engine) => engine.file(),
             FileEngine::Sync(engine) => engine.file(),
             FileEngine::Threaded(engine) => engine.file(),
+            FileEngine::Nbd(_) => panic!("A drive served over NBD has no backing file"),
         }
     }
 
@@ -116,6 +127,13 @@ impl FileEngine {
                 Err(RequestError {
                     req: err.req,
                     error: BlockIoError::Threaded(err.error),
+                })
+            }
+            FileEngine::Nbd(_) => {
+                let err = NbdFileEngine::refuse(req);
+                Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Nbd(err.error),
                 })
             }
             FileEngine::Sync(engine) => match engine.read(offset, mem, addr, count) {
@@ -151,6 +169,13 @@ impl FileEngine {
                     error: BlockIoError::Threaded(err.error),
                 })
             }
+            FileEngine::Nbd(_) => {
+                let err = NbdFileEngine::refuse(req);
+                Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Nbd(err.error),
+                })
+            }
             FileEngine::Sync(engine) => match engine.write(offset, mem, addr, count) {
                 Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
                 Err(err) => Err(RequestError {
@@ -180,6 +205,13 @@ impl FileEngine {
                     error: BlockIoError::Threaded(err.error),
                 })
             }
+            FileEngine::Nbd(_) => {
+                let err = NbdFileEngine::refuse(req);
+                Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Nbd(err.error),
+                })
+            }
             FileEngine::Sync(engine) => match engine.flush() {
                 Ok(_) => Ok(FileEngineOk::Executed(RequestOk { req, count: 0 })),
                 Err(err) => Err(RequestError {
@@ -195,6 +227,7 @@ impl FileEngine {
             FileEngine::Async(engine) => engine.drain(discard).map_err(BlockIoError::Async),
             FileEngine::Sync(_engine) => Ok(()),
             FileEngine::Threaded(engine) => engine.drain(discard).map_err(BlockIoError::Threaded),
+            FileEngine::Nbd(engine) => engine.drain(discard).map_err(BlockIoError::Nbd),
         }
     }
 
@@ -207,7 +240,118 @@ impl FileEngine {
             FileEngine::Threaded(engine) => engine
                 .drain_and_flush(discard)
                 .map_err(BlockIoError::Threaded),
+            FileEngine::Nbd(engine) => engine.drain_and_flush(discard).map_err(BlockIoError::Nbd),
         }
+    }
+
+    /// The engine's worker thread, for engines whose worker serves the queue itself.
+    pub fn queue_worker(&self) -> Option<&dyn QueueWorker> {
+        match self {
+            FileEngine::Threaded(engine) => Some(engine),
+            FileEngine::Nbd(engine) => Some(engine),
+            _ => None,
+        }
+    }
+
+    pub fn queue_worker_mut(&mut self) -> Option<&mut dyn QueueWorker> {
+        match self {
+            FileEngine::Threaded(engine) => Some(engine),
+            FileEngine::Nbd(engine) => Some(engine),
+            _ => None,
+        }
+    }
+}
+
+/// An engine whose worker thread takes the device's queue, and serves it, from activation on.
+pub trait QueueWorker: Debug {
+    /// Whether the worker serves the device's queue.
+    fn is_serving(&self) -> bool;
+    /// Hand the device's queue and rate limiter to the worker.
+    fn start(
+        &mut self,
+        serving: threaded_io::Serving,
+        device_rate_limiter: &mut RateLimiter,
+    ) -> Result<(), BlockIoError>;
+    /// Take the queue and the rate limiter back. The NBD engine first waits for the requests in
+    /// flight and has the server flush; should that fail, the worker keeps serving.
+    fn stop(
+        &mut self,
+        device_rate_limiter: &mut RateLimiter,
+    ) -> Result<Option<Queue>, BlockIoError>;
+    /// Have the worker look at the queue, as if the guest had notified it.
+    fn kick(&self) -> Result<(), BlockIoError>;
+    /// The rate limiter the worker uses, while it serves the queue.
+    fn rate_limiter(&self) -> Option<&Arc<Mutex<RateLimiter>>>;
+    /// Update the worker's rate limiter, or return the updates when it serves nothing.
+    fn update_rate_limiter(
+        &self,
+        bytes: BucketUpdate,
+        ops: BucketUpdate,
+    ) -> Option<(BucketUpdate, BucketUpdate)>;
+}
+
+impl QueueWorker for ThreadedFileEngine {
+    fn is_serving(&self) -> bool {
+        ThreadedFileEngine::is_serving(self)
+    }
+    fn start(
+        &mut self,
+        serving: threaded_io::Serving,
+        device_rate_limiter: &mut RateLimiter,
+    ) -> Result<(), BlockIoError> {
+        ThreadedFileEngine::start(self, serving, device_rate_limiter)
+            .map_err(BlockIoError::Threaded)
+    }
+    fn stop(
+        &mut self,
+        device_rate_limiter: &mut RateLimiter,
+    ) -> Result<Option<Queue>, BlockIoError> {
+        ThreadedFileEngine::stop(self, device_rate_limiter).map_err(BlockIoError::Threaded)
+    }
+    fn kick(&self) -> Result<(), BlockIoError> {
+        ThreadedFileEngine::kick(self).map_err(BlockIoError::Threaded)
+    }
+    fn rate_limiter(&self) -> Option<&Arc<Mutex<RateLimiter>>> {
+        ThreadedFileEngine::rate_limiter(self)
+    }
+    fn update_rate_limiter(
+        &self,
+        bytes: BucketUpdate,
+        ops: BucketUpdate,
+    ) -> Option<(BucketUpdate, BucketUpdate)> {
+        ThreadedFileEngine::update_rate_limiter(self, bytes, ops)
+    }
+}
+
+impl QueueWorker for NbdFileEngine {
+    fn is_serving(&self) -> bool {
+        NbdFileEngine::is_serving(self)
+    }
+    fn start(
+        &mut self,
+        serving: threaded_io::Serving,
+        device_rate_limiter: &mut RateLimiter,
+    ) -> Result<(), BlockIoError> {
+        NbdFileEngine::start(self, serving, device_rate_limiter).map_err(BlockIoError::Nbd)
+    }
+    fn stop(
+        &mut self,
+        device_rate_limiter: &mut RateLimiter,
+    ) -> Result<Option<Queue>, BlockIoError> {
+        NbdFileEngine::stop(self, device_rate_limiter).map_err(BlockIoError::Nbd)
+    }
+    fn kick(&self) -> Result<(), BlockIoError> {
+        NbdFileEngine::kick(self).map_err(BlockIoError::Nbd)
+    }
+    fn rate_limiter(&self) -> Option<&Arc<Mutex<RateLimiter>>> {
+        NbdFileEngine::rate_limiter(self)
+    }
+    fn update_rate_limiter(
+        &self,
+        bytes: BucketUpdate,
+        ops: BucketUpdate,
+    ) -> Option<(BucketUpdate, BucketUpdate)> {
+        NbdFileEngine::update_rate_limiter(self, bytes, ops)
     }
 }
 

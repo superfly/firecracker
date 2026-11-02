@@ -1320,6 +1320,7 @@ mod tests {
                 file_engine_type: None,
 
                 socket: None,
+                nbd: None,
             },
         )));
         check_unsupported(runtime_request(VmmAction::InsertNetworkDevice(

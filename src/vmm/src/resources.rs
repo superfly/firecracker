@@ -605,6 +605,7 @@ mod tests {
                 file_engine_type: None,
 
                 socket: None,
+                nbd: None,
             },
             tmp_file,
         )

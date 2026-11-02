@@ -59,7 +59,7 @@ pub fn set_worker_seccomp_filter(filter: Arc<BpfProgram>) {
     let _ = WORKER_SECCOMP_FILTER.set(filter);
 }
 
-fn worker_seccomp_filter() -> Option<BpfProgramRef<'static>> {
+pub(crate) fn worker_seccomp_filter() -> Option<BpfProgramRef<'static>> {
     WORKER_SECCOMP_FILTER.get().map(|filter| filter.as_slice())
 }
 

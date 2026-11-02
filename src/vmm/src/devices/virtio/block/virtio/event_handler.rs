@@ -15,8 +15,8 @@ impl VirtioBlock {
     const PROCESS_ASYNC_COMPLETION: u32 = 3;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
-        // The threaded engine's worker serves the queue, and has its events.
-        if matches!(self.disk.file_engine, FileEngine::Threaded(_)) {
+        // The threaded and NBD engines' workers serve the queue, and have its events.
+        if self.disk.file_engine.queue_worker().is_some() {
             return;
         }
         if let Err(err) = ops.add(Events::with_data(

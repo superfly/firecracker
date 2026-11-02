@@ -20,6 +20,7 @@ use vm_memory::ByteValued;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::io::async_io;
+use super::io::{NbdBackendConfig, NbdFileEngine};
 use super::request::*;
 use super::{
     BLOCK_QUEUE_SIZES, RATE_LIMITER_MIN_REFILL_DELAY, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError,
@@ -55,6 +56,9 @@ pub enum FileEngineType {
     Sync,
     /// Use a Threaded engine: blocking system calls, made from a worker thread per drive.
     Threaded,
+    /// Serve the drive from an NBD server on a Unix socket, which a worker thread per drive
+    /// talks to, with many requests in flight. Needs the drive's `nbd` settings.
+    Nbd,
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
@@ -64,6 +68,8 @@ pub struct DiskProperties {
     pub file_engine: FileEngine,
     pub nsectors: u64,
     pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    /// Where the drive is served from, when it is served over NBD.
+    pub nbd: Option<NbdBackendConfig>,
 }
 
 impl DiskProperties {
@@ -111,7 +117,32 @@ impl DiskProperties {
                 .map_err(VirtioBlockError::FileEngine)?,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id,
+            nbd: None,
         })
+    }
+
+    /// Connect to the NBD server the drive is served from. `file_path` only names the drive.
+    pub fn new_nbd(config: NbdBackendConfig, file_path: String) -> Result<Self, VirtioBlockError> {
+        let engine = NbdFileEngine::connect(config.clone())
+            .map_err(|err| VirtioBlockError::FileEngine(block_io::BlockIoError::Nbd(err)))?;
+        let nsectors = engine.size() >> SECTOR_SHIFT;
+        // The export's name is what identifies the disk.
+        let mut image_id = [0; VIRTIO_BLK_ID_BYTES as usize];
+        let name = config.export_name.as_bytes();
+        let len = cmp::min(name.len(), image_id.len());
+        image_id[..len].copy_from_slice(&name[..len]);
+        Ok(Self {
+            file_path,
+            file_engine: FileEngine::Nbd(engine),
+            nsectors,
+            image_id,
+            nbd: Some(config),
+        })
+    }
+
+    /// Whether the NBD server offers the drive read-only.
+    fn nbd_read_only(&self) -> bool {
+        matches!(&self.file_engine, FileEngine::Nbd(engine) if engine.read_only())
     }
 
     /// Update the path to the file backing the block device
@@ -203,13 +234,24 @@ pub struct VirtioBlockConfig {
     #[serde(default)]
     #[serde(rename = "io_engine")]
     pub file_engine_type: FileEngineType,
+    /// The NBD server the drive is served from, with the Nbd engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbd: Option<NbdBackendConfig>,
 }
 
 impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
     type Error = VirtioBlockError;
 
     fn try_from(value: &BlockDeviceConfig) -> Result<Self, Self::Error> {
-        if value.path_on_host.is_some() && value.socket.is_none() {
+        // A drive served over NBD needs no path; it names the drive if given.
+        if (value.path_on_host.is_some() || value.nbd.is_some()) && value.socket.is_none() {
+            let file_engine_type = match (&value.nbd, value.file_engine_type) {
+                (Some(_), None | Some(FileEngineType::Nbd)) => FileEngineType::Nbd,
+                (None, Some(FileEngineType::Nbd)) | (Some(_), Some(_)) => {
+                    return Err(VirtioBlockError::Config);
+                }
+                (None, engine) => engine.unwrap_or_default(),
+            };
             Ok(Self {
                 drive_id: value.drive_id.clone(),
                 partuuid: value.partuuid.clone(),
@@ -217,9 +259,10 @@ impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
                 cache_type: value.cache_type,
 
                 is_read_only: value.is_read_only.unwrap_or(false),
-                path_on_host: value.path_on_host.as_ref().unwrap().clone(),
+                path_on_host: value.path_on_host.clone().unwrap_or_default(),
                 rate_limiter: value.rate_limiter,
-                file_engine_type: value.file_engine_type.unwrap_or_default(),
+                file_engine_type,
+                nbd: value.nbd.clone(),
             })
         } else {
             Err(VirtioBlockError::Config)
@@ -236,11 +279,13 @@ impl From<VirtioBlockConfig> for BlockDeviceConfig {
             cache_type: value.cache_type,
 
             is_read_only: Some(value.is_read_only),
-            path_on_host: Some(value.path_on_host),
+            path_on_host: (value.nbd.is_none() || !value.path_on_host.is_empty())
+                .then_some(value.path_on_host),
             rate_limiter: value.rate_limiter,
             file_engine_type: Some(value.file_engine_type),
 
             socket: None,
+            nbd: value.nbd,
         }
     }
 }
@@ -289,12 +334,20 @@ impl VirtioBlock {
     /// Create a new virtio block device that operates on the given file.
     ///
     /// The given file must be seekable and sizable.
-    pub fn new(config: VirtioBlockConfig) -> Result<VirtioBlock, VirtioBlockError> {
-        let disk_properties = DiskProperties::new(
-            config.path_on_host,
-            config.is_read_only,
-            config.file_engine_type,
-        )?;
+    pub fn new(mut config: VirtioBlockConfig) -> Result<VirtioBlock, VirtioBlockError> {
+        let disk_properties = match config.nbd.clone() {
+            Some(nbd) => {
+                let disk = DiskProperties::new_nbd(nbd, config.path_on_host)?;
+                // A guest that writes to an export the server offers read-only fails.
+                config.is_read_only |= disk.nbd_read_only();
+                disk
+            }
+            None => DiskProperties::new(
+                config.path_on_host,
+                config.is_read_only,
+                config.file_engine_type,
+            )?,
+        };
 
         let mut rate_limiter: RateLimiter = config
             .rate_limiter
@@ -361,6 +414,7 @@ impl VirtioBlock {
             cache_type: self.cache_type,
             rate_limiter: rl.into_option(),
             file_engine_type: self.file_engine_type(),
+            nbd: self.disk.nbd.clone(),
         }
     }
 
@@ -549,6 +603,11 @@ impl VirtioBlock {
 
     /// Update the backing file and the config space of the block device.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
+        if self.disk.nbd.is_some() {
+            return Err(VirtioBlockError::FileEngine(block_io::BlockIoError::Nbd(
+                block_io::NbdIoError::NoBackingFile,
+            )));
+        }
         self.disk.update(disk_image_path, self.read_only)?;
         self.threaded_disk_updated();
         self.config_space.capacity = self.disk.nsectors.to_le(); // virtio_block_config_space();
@@ -577,6 +636,7 @@ impl VirtioBlock {
             FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
             FileEngine::Threaded(_) => FileEngineType::Threaded,
+            FileEngine::Nbd(_) => FileEngineType::Nbd,
         }
     }
 
@@ -584,6 +644,18 @@ impl VirtioBlock {
         if let Err(err) = self.disk.file_engine.drain_and_flush(discard) {
             error!("Failed to drain ops and flush block data: {:?}", err);
         }
+    }
+
+    /// Get the device ready to be snapshotted, failing if it cannot be: for the NBD engine, wait
+    /// for the requests in flight and have the server flush, so that the snapshot holds no
+    /// request in flight and every write the guest saw complete is durable. If that fails, the
+    /// worker carries on serving the queue, and the snapshot must not be taken. Other engines
+    /// have nothing to do here, and get ready in `prepare_save`.
+    pub fn quiesce(&mut self) -> Result<(), VirtioBlockError> {
+        if !self.is_activated() || !matches!(self.disk.file_engine, FileEngine::Nbd(_)) {
+            return Ok(());
+        }
+        self.threaded_try_stop()
     }
 
     /// Prepare device for being snapshotted.
@@ -747,6 +819,7 @@ mod tests {
             file_engine_type: Default::default(),
 
             socket: None,
+            nbd: None,
         };
         VirtioBlockConfig::try_from(&block_config).unwrap();
 
@@ -762,6 +835,7 @@ mod tests {
             file_engine_type: Default::default(),
 
             socket: Some("sock".to_string()),
+            nbd: None,
         };
         VirtioBlockConfig::try_from(&block_config).unwrap_err();
 
@@ -777,6 +851,7 @@ mod tests {
             file_engine_type: Default::default(),
 
             socket: Some("sock".to_string()),
+            nbd: None,
         };
         VirtioBlockConfig::try_from(&block_config).unwrap_err();
     }

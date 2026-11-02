@@ -326,6 +326,37 @@ impl DeviceManager {
         }
     }
 
+    fn quiesce_block_device(
+        device: &Arc<Mutex<dyn VirtioDevice>>,
+    ) -> Result<(), crate::devices::virtio::block::BlockError> {
+        let mut locked_device = device.lock().expect("Poisoned lock");
+        if locked_device.device_type()
+            != crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BLOCK
+        {
+            return Ok(());
+        }
+        match locked_device
+            .as_mut_any()
+            .downcast_mut::<crate::devices::virtio::block::device::Block>()
+        {
+            Some(block) => block.quiesce(),
+            None => Ok(()),
+        }
+    }
+
+    /// Get every block device ready for a snapshot, or fail it: see `Block::quiesce`.
+    pub fn quiesce_block_devices(&self) -> Result<(), crate::devices::virtio::block::BlockError> {
+        self.mmio_devices.for_each_virtio_device(|_, _, device| {
+            let mmio_transport_locked = device.inner.lock().expect("Poisoned lock");
+            Self::quiesce_block_device(&mmio_transport_locked.device())
+        })?;
+        for device in self.pci_devices.virtio_devices.values() {
+            let virtio_device = device.lock().expect("Poisoned lock").virtio_device();
+            Self::quiesce_block_device(&virtio_device)?;
+        }
+        Ok(())
+    }
+
     fn do_mark_virtio_queue_memory_dirty(
         device: Arc<Mutex<dyn VirtioDevice>>,
         mem: &GuestMemoryMmap,

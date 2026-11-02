@@ -7,11 +7,13 @@ pub mod device;
 mod event_handler;
 mod io;
 pub mod metrics;
+pub mod nbd;
 pub mod persist;
 pub mod request;
 pub mod test_utils;
 mod threaded;
 
+pub use self::io::NbdBackendConfig;
 pub use self::io::threaded_io::set_worker_seccomp_filter;
 
 use vm_memory::GuestMemoryError;
