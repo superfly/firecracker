@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use utils::time::{ClockType, get_time_us};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -37,7 +38,7 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestMemoryRegion, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -397,6 +398,24 @@ pub fn restore_from_snapshot(
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
 
+    // A vhost-user backend maps guest memory from file descriptors the VMM sends it, so its
+    // guest memory has to be shared, not the private mapping of the memory file used otherwise.
+    let vhost_user = microvm_state
+        .device_states
+        .mmio_state
+        .block_devices
+        .iter()
+        .map(|b| &b.device_state)
+        .chain(
+            microvm_state
+                .device_states
+                .pci_state
+                .block_devices
+                .iter()
+                .map(|b| &b.device_state),
+        )
+        .any(|state| state.is_vhost_user());
+
     let (guest_memory, uffd) = match params.mem_backend.backend_type {
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
@@ -405,11 +424,21 @@ pub fn restore_from_snapshot(
                 )
                 .into());
             }
-            (
+            let guest_memory = if vhost_user {
+                guest_memory_from_file_memfd(mem_backend_path, mem_state, track_dirty_pages)
+            } else {
                 guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
-                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
+            };
+            (
+                guest_memory.map_err(RestoreFromSnapshotGuestMemoryError::File)?,
                 None,
             )
+        }
+        MemBackendType::Uffd if vhost_user => {
+            return Err(RestoreFromSnapshotGuestMemoryError::Uffd(
+                GuestMemoryFromUffdError::VhostUser,
+            )
+            .into());
         }
         MemBackendType::Uffd => guest_memory_from_uffd(
             mem_backend_path,
@@ -473,9 +502,62 @@ fn guest_memory_from_file(
     Ok(guest_mem)
 }
 
+/// Copy the memory file into a memfd and map that shared, for a VM with vhost-user devices.
+///
+/// Mapping the memory file itself shared would avoid the copy, but the guest would then write
+/// to the snapshot: the file could not be restored again, and on a disk-backed filesystem guest
+/// memory would be written back to the disk.
+fn guest_memory_from_file_memfd(
+    mem_file_path: &Path,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
+    let start_us = get_time_us(ClockType::Monotonic);
+    let mem_file = File::open(mem_file_path)?;
+    let regions: Vec<_> = mem_state.regions().collect();
+    let guest_mem = memory::memfd_backed(&regions, track_dirty_pages, HugePageConfig::None)?;
+    let mut copied = 0u64;
+    for region in &guest_mem {
+        let len = u64_to_usize(region.len());
+        let base = region.as_ptr();
+        let mut done = 0usize;
+        while done < len {
+            // SAFETY: the destination lies within this region's mapping, which is writable and
+            // stays mapped for the duration of the call.
+            let n = unsafe {
+                libc::pread64(
+                    mem_file.as_raw_fd(),
+                    base.add(done).cast(),
+                    len - done,
+                    i64::try_from(copied + done as u64).map_err(|_| MemoryError::OffsetTooLarge)?,
+                )
+            };
+            match n {
+                n if n > 0 => done += n.cast_unsigned(),
+                0 => return Err(MemoryError::OffsetTooLarge.into()),
+                _ => {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        return Err(err.into());
+                    }
+                }
+            }
+        }
+        copied += len as u64;
+    }
+    info!(
+        "Copied {} MiB of guest memory into a memfd in {} us",
+        copied >> 20,
+        get_time_us(ClockType::Monotonic) - start_us
+    );
+    Ok(guest_mem)
+}
+
 /// Error type for [`guest_memory_from_uffd`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum GuestMemoryFromUffdError {
+    /// A snapshot with vhost-user devices cannot be restored through uffd
+    VhostUser,
     /// Failed to restore guest memory: {0}
     Restore(#[from] MemoryError),
     /// Failed to UFFD object: {0}

@@ -224,7 +224,14 @@ impl VirtioDevice for Block {
         // any inflight `timer_fd` events can be safely discarded.
         if self.is_activated() {
             info!("kick block {}.", self.id());
-            self.process_virtio_queues();
+            match self {
+                Self::Virtio(_) => {
+                    let _ = self.process_virtio_queues();
+                }
+                // The backend serves the queue; give it back its ring if a snapshot stopped it,
+                // and interrupt the guest for completions whose interrupt the snapshot lost.
+                Self::VhostUser(b) => b.resume(),
+            }
         }
     }
 }

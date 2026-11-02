@@ -20,8 +20,10 @@ pub const QUEUE_SIZE: u16 = 256;
 pub enum VhostUserBlockError {
     /// Cannot create config
     Config,
-    /// Snapshotting of vhost-user-blk devices is not supported
-    SnapshottingNotSupported,
+    /// The backend no longer offers the features saved in the snapshot: saved {saved:#x}, offered {offered:#x}
+    RestoreFeatures { saved: u64, offered: u64 },
+    /// Cannot restore the queues: {0}
+    Persist(crate::devices::virtio::persist::PersistError),
     /// Vhost-user error: {0}
     VhostUser(VhostUserError),
     /// Vhost error: {0}

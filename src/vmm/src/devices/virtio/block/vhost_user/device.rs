@@ -7,7 +7,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use log::error;
+use log::{error, info};
 use utils::time::{ClockType, get_time_us};
 use vhost::vhost_user::Frontend;
 use vhost::vhost_user::message::*;
@@ -17,7 +17,10 @@ use super::{NUM_QUEUES, QUEUE_SIZE, VhostUserBlockError};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice};
-use crate::devices::virtio::generated::virtio_blk::{VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO};
+use crate::devices::virtio::generated::virtio_blk::{
+    VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO,
+    VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_SIZE_MAX, VIRTIO_BLK_F_WRITE_ZEROES,
+};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_BLOCK;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -43,7 +46,15 @@ const AVAILABLE_FEATURES: u64 = (1 << VIRTIO_F_VERSION_1)
     | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     // We always try to negotiate readonly with the backend.
     // If the backend is configured as readonly, we will accept it.
-    | (1 << VIRTIO_BLK_F_RO);
+    | (1 << VIRTIO_BLK_F_RO)
+    // Request shape and the optional commands are the backend's to describe: the guest reads
+    // their limits from the config space, which comes from the backend too. Without SEG_MAX the
+    // guest sends one data buffer per request.
+    | (1 << VIRTIO_BLK_F_SIZE_MAX)
+    | (1 << VIRTIO_BLK_F_SEG_MAX)
+    | (1 << VIRTIO_BLK_F_BLK_SIZE)
+    | (1 << VIRTIO_BLK_F_DISCARD)
+    | (1 << VIRTIO_BLK_F_WRITE_ZEROES);
 
 /// Use this structure to set up the Block Device before booting the kernel.
 #[derive(Debug, PartialEq, Eq)]
@@ -133,6 +144,9 @@ pub struct VhostUserBlockImpl<T: VhostUserHandleBackend> {
     pub vu_handle: VhostUserHandleImpl<T>,
     pub vu_acked_protocol_features: u64,
     pub metrics: Arc<VhostUserDeviceMetrics>,
+    /// The backend's rings are stopped for a snapshot and must be set up again before the guest
+    /// runs.
+    pub vrings_stopped: bool,
 }
 
 // Need custom implementation because otherwise `Debug` is required for `vhost::Master`
@@ -157,6 +171,7 @@ impl<T: VhostUserHandleBackend> std::fmt::Debug for VhostUserBlockImpl<T> {
                 &self.vu_acked_protocol_features,
             )
             .field("metrics", &self.metrics)
+            .field("vrings_stopped", &self.vrings_stopped)
             .finish()
     }
 }
@@ -236,12 +251,99 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
             vu_handle,
             vu_acked_protocol_features: acked_protocol_features,
             metrics,
+            vrings_stopped: false,
         })
     }
 
     /// Prepare device for being snapshotted.
+    ///
+    /// Stops the backend's ring with `GET_VRING_BASE`. A backend replies once every request it
+    /// took from the ring has completed and is durable, so after this the used ring and the
+    /// queue's `next_avail` describe all the device has done, and guest memory, saved after the
+    /// devices, holds it. The ring stays stopped until [`Self::restart_vrings`].
     pub fn prepare_save(&mut self) {
-        unimplemented!("VhostUserBlock does not support snapshotting yet");
+        if !self.device_state.is_activated() || self.vrings_stopped {
+            return;
+        }
+        let start_time = get_time_us(ClockType::Monotonic);
+        match self.vu_handle.stop_vring(0) {
+            Ok(base) => {
+                // Everything the backend took is complete, so the used index equals it.
+                self.queues[0].next_avail = std::num::Wrapping(base);
+                self.queues[0].next_used = std::num::Wrapping(base);
+                self.vrings_stopped = true;
+                info!(
+                    "vhost-user block {}: ring stopped at {} in {} us",
+                    self.id,
+                    base,
+                    get_time_us(ClockType::Monotonic) - start_time
+                );
+            }
+            Err(err) => {
+                // The backend is gone, and with it whatever it had in flight. Resume from what
+                // the used ring says it completed: requests taken but never completed are
+                // offered again.
+                let used = self.queues[0].used_ring_idx_get();
+                error!(
+                    "vhost-user block {}: cannot stop the ring ({}); saving used index {}",
+                    self.id, err, used
+                );
+                self.metrics.activate_fails.inc();
+                self.queues[0].next_avail = std::num::Wrapping(used);
+                self.queues[0].next_used = std::num::Wrapping(used);
+            }
+        }
+    }
+
+    /// Hand the backend its rings again after [`Self::prepare_save`] stopped them, as when the
+    /// VM resumes after a snapshot instead of exiting.
+    pub fn restart_vrings(&mut self) -> Result<(), VhostUserBlockError> {
+        if !self.vrings_stopped {
+            return Ok(());
+        }
+        let active = self
+            .device_state
+            .active_state()
+            .expect("Device is not initialized");
+        let (mem, interrupt) = (active.mem.clone(), active.interrupt.clone());
+        self.vu_handle
+            .setup_vrings(
+                &mem,
+                &[(0, &self.queues[0], &self.queue_evts[0])],
+                interrupt,
+            )
+            .map_err(VhostUserBlockError::VhostUser)?;
+        self.vrings_stopped = false;
+        Ok(())
+    }
+
+    /// Called as the VM resumes: give the backend back its rings if they were stopped, then
+    /// interrupt the guest once.
+    ///
+    /// A snapshot saves the vCPUs, the irqchip and the transport before [`Self::prepare_save`]
+    /// stops the ring, and the backend completes what it has in flight before it replies. A
+    /// request completed in that window reaches the used ring, which is saved with guest memory,
+    /// but its interrupt is not saved anywhere. With VIRTIO_RING_F_EVENT_IDX the guest's
+    /// used_event then stays behind and suppresses every later interrupt, so the guest would
+    /// never see a completion again. A spurious interrupt is harmless.
+    pub fn resume(&mut self) {
+        let Some(active) = self.device_state.active_state() else {
+            return;
+        };
+        let interrupt = active.interrupt.clone();
+        if let Err(err) = self.restart_vrings() {
+            error!(
+                "vhost-user block {}: cannot restart the ring: {}",
+                self.id, err
+            );
+            self.metrics.activate_fails.inc();
+        }
+        if let Err(err) = interrupt.trigger(VirtioInterruptType::Queue(0)) {
+            error!(
+                "vhost-user block {}: cannot interrupt the guest: {:?}",
+                self.id, err
+            );
+        }
     }
 
     pub fn config(&self) -> VhostUserBlockConfig {
@@ -376,7 +478,7 @@ impl<T: VhostUserHandleBackend + Send + 'static> VirtioDevice for VhostUserBlock
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
     use std::os::unix::net::UnixStream;
@@ -807,5 +909,187 @@ mod tests {
         assert!(unsafe { *vhost_block.vu_handle.vu.memory_is_set.get() });
         assert!(unsafe { *vhost_block.vu_handle.vu.vring_enabled.get() });
         assert!(vhost_block.is_activated());
+    }
+
+    /// A backend that records the vring messages it gets, for the snapshot tests.
+    pub(crate) struct RingMockFrontend {
+        pub(crate) features: u64,
+        pub(crate) base: std::cell::UnsafeCell<u16>,
+        pub(crate) setups: std::cell::UnsafeCell<u32>,
+        pub(crate) stops: std::cell::UnsafeCell<u32>,
+        pub(crate) fail_stop: bool,
+    }
+
+    impl VhostUserHandleBackend for RingMockFrontend {
+        fn from_stream(_sock: UnixStream, _max_queue_num: u64) -> Self {
+            Self {
+                features: AVAILABLE_FEATURES | (1 << VIRTIO_BLK_F_FLUSH),
+                base: std::cell::UnsafeCell::new(0),
+                setups: std::cell::UnsafeCell::new(0),
+                stops: std::cell::UnsafeCell::new(0),
+                fail_stop: false,
+            }
+        }
+        fn set_owner(&self) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+        fn set_hdr_flags(&self, _flags: VhostUserHeaderFlag) {}
+        fn get_features(&self) -> Result<u64, vhost::Error> {
+            Ok(self.features)
+        }
+        fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures, vhost::Error> {
+            Ok(VhostUserProtocolFeatures::CONFIG)
+        }
+        fn set_protocol_features(
+            &mut self,
+            _features: VhostUserProtocolFeatures,
+        ) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+        fn get_config(
+            &mut self,
+            _offset: u32,
+            _size: u32,
+            _flags: VhostUserConfigFlags,
+            _buf: &[u8],
+        ) -> Result<(VhostUserConfig, VhostUserConfigPayload), vhost::Error> {
+            Ok((
+                VhostUserConfig::default(),
+                vec![7; BLOCK_CONFIG_SPACE_SIZE as usize],
+            ))
+        }
+        fn set_features(&self, _features: u64) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+        fn set_mem_table(
+            &self,
+            _regions: &[VhostUserMemoryRegionInfo],
+        ) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+        fn set_vring_num(&self, _queue_index: usize, _num: u16) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+        fn set_vring_addr(
+            &self,
+            _queue_index: usize,
+            _config_data: &VringConfigData,
+        ) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+        fn set_vring_base(&self, _queue_index: usize, base: u16) -> Result<(), vhost::Error> {
+            unsafe { *self.base.get() = base };
+            Ok(())
+        }
+        fn get_vring_base(&self, _queue_index: usize) -> Result<u32, vhost::Error> {
+            unsafe { *self.stops.get() += 1 };
+            if self.fail_stop {
+                return Err(vhost::Error::VhostUserProtocol(
+                    vhost::vhost_user::Error::SocketBroken(std::io::Error::from(
+                        std::io::ErrorKind::BrokenPipe,
+                    )),
+                ));
+            }
+            Ok(5)
+        }
+        fn set_vring_call(&self, _queue_index: usize, _fd: &EventFd) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+        fn set_vring_kick(&self, _queue_index: usize, _fd: &EventFd) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+        fn set_vring_enable(
+            &mut self,
+            _queue_index: usize,
+            _enable: bool,
+        ) -> Result<(), vhost::Error> {
+            unsafe { *self.setups.get() += 1 };
+            Ok(())
+        }
+    }
+
+    /// An activated device on the recording backend, with its guest memory.
+    pub(crate) fn activated_ring_mock() -> (
+        VhostUserBlockImpl<RingMockFrontend>,
+        GuestMemoryMmap,
+        vmm_sys_util::tempdir::TempDir,
+    ) {
+        let (tmp_dir, tmp_socket_path) = create_tmp_socket();
+        let config = VhostUserBlockConfig {
+            drive_id: "test_drive".to_string(),
+            partuuid: None,
+            is_root_device: false,
+            cache_type: CacheType::Writeback,
+            socket: tmp_socket_path,
+        };
+        let mut block = VhostUserBlockImpl::<RingMockFrontend>::new(config).unwrap();
+        let region_size = 0x10000;
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(region_size as u64).unwrap();
+        let mem = create_mem(file, &[(GuestAddress(0x0), region_size)]);
+        let q = VirtQueue::new(GuestAddress(0), &mem, QUEUE_SIZE);
+        block.queues[0] = q.create_queue();
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        (block, mem, tmp_dir)
+    }
+
+    #[test]
+    fn test_prepare_save_stops_ring_and_resume_restarts_it() {
+        let (mut block, _mem, _tmp) = activated_ring_mock();
+        assert_eq!(unsafe { *block.vu_handle.vu.setups.get() }, 1);
+        assert_eq!(unsafe { *block.vu_handle.vu.base.get() }, 0);
+
+        // The snapshot stops the ring where the backend says it stopped.
+        block.prepare_save();
+        assert!(block.vrings_stopped);
+        assert_eq!(block.queues[0].next_avail.0, 5);
+        assert_eq!(block.queues[0].next_used.0, 5);
+        // Saving twice doesn't stop it twice.
+        block.prepare_save();
+        assert_eq!(unsafe { *block.vu_handle.vu.stops.get() }, 1);
+
+        // Resuming hands the ring back at the same index, and interrupts the guest for
+        // completions whose interrupt the snapshot lost.
+        block.interrupt_status().store(0, Ordering::SeqCst);
+        block.resume();
+        assert!(!block.vrings_stopped);
+        assert_eq!(unsafe { *block.vu_handle.vu.setups.get() }, 2);
+        assert_eq!(unsafe { *block.vu_handle.vu.base.get() }, 5);
+        assert_ne!(block.interrupt_status().load(Ordering::SeqCst), 0);
+
+        // A resume with nothing stopped only interrupts.
+        block.resume();
+        assert_eq!(unsafe { *block.vu_handle.vu.setups.get() }, 2);
+    }
+
+    #[test]
+    fn test_prepare_save_backend_gone() {
+        let (mut block, _mem, _tmp) = activated_ring_mock();
+        block.vu_handle.vu.fail_stop = true;
+        // As if the guest had seen three completions.
+        block.queues[0].used_ring_idx_set(3);
+        block.prepare_save();
+        // The ring is not known to be stopped, and the saved index is what the used ring says
+        // completed.
+        assert!(!block.vrings_stopped);
+        assert_eq!(block.queues[0].next_avail.0, 3);
+    }
+
+    #[test]
+    fn test_prepare_save_inactive() {
+        let (tmp_dir, tmp_socket_path) = create_tmp_socket();
+        let _tmp_dir = tmp_dir;
+        let config = VhostUserBlockConfig {
+            drive_id: "test_drive".to_string(),
+            partuuid: None,
+            is_root_device: false,
+            cache_type: CacheType::Writeback,
+            socket: tmp_socket_path,
+        };
+        let mut block = VhostUserBlockImpl::<RingMockFrontend>::new(config).unwrap();
+        block.prepare_save();
+        block.resume();
+        assert_eq!(unsafe { *block.vu_handle.vu.stops.get() }, 0);
+        assert!(!block.vrings_stopped);
     }
 }
