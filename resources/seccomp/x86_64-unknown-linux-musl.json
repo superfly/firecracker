@@ -1739,6 +1739,84 @@
                 "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
             },
             {
+                "syscall": "preadv",
+                "comment": "Reads from the backing file, into the buffers of a request"
+            },
+            {
+                "syscall": "pwritev",
+                "comment": "Writes to the backing file, from the buffers of a request"
+            },
+            {
+                "syscall": "epoll_ctl",
+                "comment": "Watches the queue and rate limiter events while serving the queue"
+            },
+            {
+                "syscall": "epoll_pwait",
+                "comment": "Waits for the queue, rate limiter and control events"
+            },
+            {
+                "syscall": "timerfd_settime",
+                "comment": "Arms the refill timer of the rate limiter",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
+                    }
+                ]
+            },
+            {
+                "syscall": "prctl",
+                "comment": "Names the thread after its drive",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15,
+                        "comment": "PR_SET_NAME"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Duplicates the backing file of a drive update",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1030,
+                        "comment": "F_DUPFD_CLOEXEC"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "musl marks the duplicate close-on-exec again after F_DUPFD_CLOEXEC",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2,
+                        "comment": "FCNTL_F_SETFD"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "FCNTL_FD_CLOEXEC"
+                    }
+                ]
+            },
+            {
+                "syscall": "fstat",
+                "comment": "Discard requests check whether the backing file is a block device"
+            },
+            {
                 "syscall": "fallocate",
                 "comment": "Discard requests on regular backing files (punch hole)",
                 "args": [

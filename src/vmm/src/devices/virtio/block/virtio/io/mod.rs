@@ -41,7 +41,6 @@ impl BlockIoError {
     pub fn is_throttling_err(&self) -> bool {
         match self {
             BlockIoError::Async(AsyncIoError::IoUring(err)) => err.is_throttling_err(),
-            BlockIoError::Threaded(ThreadedIoError::QueueFull) => true,
             _ => false,
         }
     }
@@ -111,13 +110,13 @@ impl FileEngine {
                     error: BlockIoError::Async(err.error),
                 }),
             },
-            FileEngine::Threaded(engine) => match engine.push_read(offset, mem, addr, count, req) {
-                Ok(_) => Ok(FileEngineOk::Submitted),
-                Err(err) => Err(RequestError {
+            FileEngine::Threaded(_) => {
+                let err = ThreadedFileEngine::refuse(req);
+                Err(RequestError {
                     req: err.req,
                     error: BlockIoError::Threaded(err.error),
-                }),
-            },
+                })
+            }
             FileEngine::Sync(engine) => match engine.read(offset, mem, addr, count) {
                 Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
                 Err(err) => Err(RequestError {
@@ -144,14 +143,12 @@ impl FileEngine {
                     error: BlockIoError::Async(err.error),
                 }),
             },
-            FileEngine::Threaded(engine) => {
-                match engine.push_write(offset, mem, addr, count, req) {
-                    Ok(_) => Ok(FileEngineOk::Submitted),
-                    Err(err) => Err(RequestError {
-                        req: err.req,
-                        error: BlockIoError::Threaded(err.error),
-                    }),
-                }
+            FileEngine::Threaded(_) => {
+                let err = ThreadedFileEngine::refuse(req);
+                Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Threaded(err.error),
+                })
             }
             FileEngine::Sync(engine) => match engine.write(offset, mem, addr, count) {
                 Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
@@ -175,13 +172,13 @@ impl FileEngine {
                     error: BlockIoError::Async(err.error),
                 }),
             },
-            FileEngine::Threaded(engine) => match engine.push_flush(req) {
-                Ok(_) => Ok(FileEngineOk::Submitted),
-                Err(err) => Err(RequestError {
+            FileEngine::Threaded(_) => {
+                let err = ThreadedFileEngine::refuse(req);
+                Err(RequestError {
                     req: err.req,
                     error: BlockIoError::Threaded(err.error),
-                }),
-            },
+                })
+            }
             FileEngine::Sync(engine) => match engine.flush() {
                 Ok(_) => Ok(FileEngineOk::Executed(RequestOk { req, count: 0 })),
                 Err(err) => Err(RequestError {
@@ -212,13 +209,14 @@ impl FileEngine {
                     error: BlockIoError::Sync(err),
                 }),
             },
-            FileEngine::Threaded(engine) => match engine.push_discard(range, req) {
-                Ok(_) => Ok(FileEngineOk::Submitted),
-                Err(err) => Err(RequestError {
+
+            FileEngine::Threaded(_) => {
+                let err = ThreadedFileEngine::refuse(req);
+                Err(RequestError {
                     req: err.req,
                     error: BlockIoError::Threaded(err.error),
-                }),
-            },
+                })
+            }
         }
     }
 
