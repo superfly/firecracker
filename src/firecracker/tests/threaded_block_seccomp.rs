@@ -1,11 +1,13 @@
 // Copyright 2026 Fly.io, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Everything the VMM thread does with a Threaded drive after boot, under its seccomp filter.
+//! Everything the VMM thread does with a Threaded drive after boot, under its seccomp filter, and
+//! the drive's worker serving it, under its own.
 //!
-//! The VMM thread runs under the "vmm" filter of the default policy once the microVM boots, but
-//! unit tests never apply it, so a system call the filter does not allow only shows in
-//! production. A forbidden call kills this test with SIGSYS, and a handler names it.
+//! The VMM thread runs under the "vmm" filter of the default policy once the microVM boots, and
+//! each drive's worker under the "block_io" one, but unit tests never apply them, so a system call
+//! a filter does not allow only shows in production. A forbidden call kills this test with SIGSYS,
+//! and a handler names it.
 //!
 //! The default policy is written for musl, so this only runs on musl targets, which is where the
 //! unit tests run in CI.
@@ -19,8 +21,11 @@ use std::time::{Duration, Instant};
 
 use vmm::devices::virtio::block::virtio::device::{FileEngineType, VirtioBlock};
 use vmm::devices::virtio::block::virtio::test_utils::{default_block, set_queue};
-use vmm::devices::virtio::block::virtio::{RequestHeader, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_OUT};
+use vmm::devices::virtio::block::virtio::{
+    RequestHeader, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_OUT, set_worker_seccomp_filter,
+};
 use vmm::devices::virtio::device::VirtioDevice;
+use vmm::devices::virtio::generated::virtio_blk::{VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_T_DISCARD};
 use vmm::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use vmm::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
 use vmm::rate_limiter::{BucketUpdate, RateLimiter};
@@ -28,8 +33,8 @@ use vmm::seccomp::BpfProgram;
 use vmm::vstate::memory::{Bytes, GuestAddress};
 use vmm_sys_util::tempfile::TempFile;
 
-/// The "vmm" filter of the default seccomp policy for this target.
-fn vmm_seccomp_filter() -> BpfProgram {
+/// A filter of the default seccomp policy for this target.
+fn seccomp_filter(category: &str) -> BpfProgram {
     let json = format!(
         "{}/../../resources/seccomp/{}-unknown-linux-musl.json",
         env!("CARGO_MANIFEST_DIR"),
@@ -40,7 +45,7 @@ fn vmm_seccomp_filter() -> BpfProgram {
     if cfg!(debug_assertions) {
         // Debug builds of the standard library check that a file descriptor is open before
         // closing it, with fcntl(F_GETFD). Release builds, which the policy is for, don't.
-        policy["vmm"]["filter"]
+        policy[category]["filter"]
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({
@@ -60,7 +65,7 @@ fn vmm_seccomp_filter() -> BpfProgram {
     )
     .unwrap();
     let mut filters = vmm::seccomp::deserialize_binary(bpf.into_file()).unwrap();
-    Arc::into_inner(filters.remove("vmm").unwrap()).unwrap()
+    Arc::into_inner(filters.remove(category).unwrap()).unwrap()
 }
 
 /// Report which system call a seccomp filter trapped, so that a failure names it.
@@ -111,9 +116,37 @@ fn write_request(block: &VirtioBlock, vq: &VirtQueue, n: u16, sector: u64) -> Gu
     GuestAddress(status)
 }
 
+/// Put a discard of `num_sectors` sectors from `sector` in the queue, as its `n`th request, and
+/// notify the device.
+fn discard_request(block: &VirtioBlock, vq: &VirtQueue, n: u16, sector: u64, num_sectors: u32) {
+    let (header, range, status) = (0x1000, 0x2800, 0x3000 + u64::from(n));
+    let first = n * 3;
+    vq.memory()
+        .write_obj(
+            RequestHeader::new(VIRTIO_BLK_T_DISCARD, 0),
+            GuestAddress(header),
+        )
+        .unwrap();
+    // struct virtio_blk_discard_write_zeroes: sector, num_sectors, flags.
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&sector.to_le_bytes());
+    bytes[8..12].copy_from_slice(&num_sectors.to_le_bytes());
+    vq.memory()
+        .write_slice(&bytes, GuestAddress(range))
+        .unwrap();
+    vq.dtable[usize::from(first)].set(header, 16, VIRTQ_DESC_F_NEXT, first + 1);
+    vq.dtable[usize::from(first + 1)].set(range, 16, VIRTQ_DESC_F_NEXT, first + 2);
+    vq.dtable[usize::from(first + 2)].set(status, 1, VIRTQ_DESC_F_WRITE, 0);
+    vq.avail.ring[usize::from(n)].set(first);
+    vq.avail.idx.set(n + 1);
+    block.queue_evts[0].write(1).unwrap();
+}
+
 #[test]
 fn test_threaded_drive_under_vmm_seccomp() {
-    let filter = vmm_seccomp_filter();
+    let filter = seccomp_filter("vmm");
+    // Workers apply it when they start, which is when their drive is created.
+    set_worker_seccomp_filter(Arc::new(seccomp_filter("block_io")));
     // SAFETY: installing a handler that only calls async-signal-safe functions.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
@@ -125,6 +158,7 @@ fn test_threaded_drive_under_vmm_seccomp() {
     // Created before the filter, as drives are, before boot.
     let mut block = default_block(FileEngineType::Threaded);
     block.rate_limiter = RateLimiter::new(0, 0, 0, 1000, 0, 1000);
+    block.acked_features |= 1 << VIRTIO_BLK_F_DISCARD;
     let mem = default_mem();
     let interrupt = default_interrupt();
     let new_file = TempFile::new().unwrap();
@@ -141,7 +175,8 @@ fn test_threaded_drive_under_vmm_seccomp() {
         block.activate(mem.clone(), interrupt).unwrap();
         block.process_virtio_queues().unwrap();
 
-        // PATCH /drives, to a file twice the size, then a write past the end of the old one.
+        // PATCH /drives, to a file twice the size, then a write past the end of the old one. The
+        // worker duplicates the new file.
         block.update_disk_image(new_path).unwrap();
         assert_eq!(block.config_space.capacity, 16);
         let status = write_request(&block, &vq, 0, 12);
@@ -164,6 +199,11 @@ fn test_threaded_drive_under_vmm_seccomp() {
             u32::from(mem.read_obj::<u8>(status).unwrap()),
             VIRTIO_BLK_S_OK
         );
+
+        // A discard: the worker checks what the file is, then punches a hole in it. Whether it
+        // can depends on the host's filesystem, so only the completion counts.
+        discard_request(&block, &vq, 2, 4, 2);
+        wait_for("the discard", || vq.used.idx.get() == 3);
 
         // The drive going away.
         drop(block);
