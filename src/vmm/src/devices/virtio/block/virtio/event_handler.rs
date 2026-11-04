@@ -13,9 +13,12 @@ impl VirtioBlock {
     const PROCESS_QUEUE: u32 = 1;
     const PROCESS_RATE_LIMITER: u32 = 2;
     const PROCESS_ASYNC_COMPLETION: u32 = 3;
-    const PROCESS_THREADED_COMPLETION: u32 = 4;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
+        // The threaded engine's worker serves the queue, and has its events.
+        if matches!(self.disk.file_engine, FileEngine::Threaded(_)) {
+            return;
+        }
         if let Err(err) = ops.add(Events::with_data(
             &self.queue_evts[0],
             Self::PROCESS_QUEUE,
@@ -34,15 +37,6 @@ impl VirtioBlock {
             && let Err(err) = ops.add(Events::with_data(
                 engine.completion_evt(),
                 Self::PROCESS_ASYNC_COMPLETION,
-                EventSet::IN,
-            ))
-        {
-            error!("Failed to register IO engine completion event: {}", err);
-        }
-        if let FileEngine::Threaded(ref engine) = self.disk.file_engine
-            && let Err(err) = ops.add(Events::with_data(
-                engine.completion_evt(),
-                Self::PROCESS_THREADED_COMPLETION,
                 EventSet::IN,
             ))
         {
@@ -94,11 +88,13 @@ impl MutEventSubscriber for VirtioBlock {
 
         if self.is_activated() {
             match source {
-                Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
+                Self::PROCESS_ACTIVATE => {
+                    self.process_activate_event(ops);
+                    self.threaded_start();
+                }
                 Self::PROCESS_QUEUE => self.process_queue_event(),
                 Self::PROCESS_RATE_LIMITER => self.process_rate_limiter_event(),
                 Self::PROCESS_ASYNC_COMPLETION => self.process_async_completion_event(),
-                Self::PROCESS_THREADED_COMPLETION => self.process_threaded_completion_event(),
                 _ => warn!("Block: Spurious event received: {:?}", source),
             }
         } else {
@@ -131,6 +127,7 @@ impl MutEventSubscriber for VirtioBlock {
         //  - on device restore from snapshot.
         if self.is_activated() {
             self.register_runtime_events(ops);
+            self.threaded_start();
         } else {
             self.register_activate_event(ops);
         }

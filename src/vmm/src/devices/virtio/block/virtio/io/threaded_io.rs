@@ -3,34 +3,41 @@
 
 //! Threaded file engine.
 //!
-//! Blocking I/O, like the sync engine, but not on the thread that submits it: each engine owns a
-//! worker thread that performs the requests one at a time, in submission order, and reports
-//! completions through an eventfd, the way the async engine does. A slow backing file then stalls
-//! only its own worker, not the event loop and every other device serviced there, and no
-//! io_uring support is needed.
+//! Each drive gets a worker thread that serves its virtqueue on its own, with blocking IO: it
+//! waits on the queue's eventfd and the rate limiter's timer, parses and rate-limits requests,
+//! reads and writes the backing file with `preadv`/`pwritev`, fills the used ring and raises the
+//! guest interrupt. A slow backing file then stalls only its own worker, not the event loop and
+//! every other device serviced there, and no io_uring support is needed.
+//!
+//! The event loop only sends the worker control messages: start and stop serving the queue, kick
+//! it, swap the backing file, and wait for it.
 
 use std::fs::File;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::mem::ManuallyDrop;
+use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
 
+use vm_memory::{GuestMemoryBackend, GuestMemoryError};
+use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::sync_io::{SyncFileEngine, SyncIoError};
-use crate::devices::virtio::block::virtio::PendingRequest;
-use crate::devices::virtio::block::virtio::io::RequestError;
-use crate::logger::error;
+use super::sync_io::file_discard_range;
+use super::{BlockIoError, RequestError};
+use crate::devices::virtio::block::virtio::metrics::BlockDeviceMetrics;
+use crate::devices::virtio::block::virtio::{
+    FinishedRequest, IoErr, PendingRequest, Request, RequestType, SECTOR_SHIFT, VIRTIO_BLK_ID_BYTES,
+};
+use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_T_DISCARD;
+use crate::devices::virtio::queue::Queue;
+use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
+use crate::logger::{IncMetric, error};
+use crate::rate_limiter::{BucketUpdate, RateLimiter};
 use crate::seccomp::{BpfProgram, BpfProgramRef};
-use crate::vstate::memory::{GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
+use crate::vstate::memory::{Bytes, GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
 
-/// Maximum number of requests submitted to the worker and not yet popped. The engine reports
-/// itself as throttled beyond this, and the device resumes processing its queue once completions
-/// come back.
-pub const THREADED_IO_MAX_IN_FLIGHT: usize = 128;
-
-/// How long a finished request may wait for the requests queued behind it before the device is
-/// told about it.
-const COMPLETION_SIGNAL_DELAY: Duration = Duration::from_micros(200);
+/// A guest buffer: its address and length.
+pub type Segment = (GuestAddress, u32);
 
 /// Filter the worker threads apply to themselves, see [`set_worker_seccomp_filter`].
 static WORKER_SECCOMP_FILTER: OnceLock<Arc<BpfProgram>> = OnceLock::new();
@@ -48,351 +55,706 @@ fn worker_seccomp_filter() -> Option<BpfProgramRef<'static>> {
     WORKER_SECCOMP_FILTER.get().map(|filter| filter.as_slice())
 }
 
+/// The prefix of the worker thread names; the rest is the start of the drive id. Linux keeps 15
+/// bytes of a thread name, which leaves 11 for the drive id.
+const THREAD_NAME_PREFIX: &str = "blk_";
+
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ThreadedIoError {
-    /// IO: {0}
-    Io(SyncIoError),
+    /// Read: {0}
+    Read(std::io::Error),
+    /// Write: {0}
+    Write(std::io::Error),
+    /// SyncAll: {0}
+    SyncAll(std::io::Error),
+    /// Discard: {0}
+    Discard(std::io::Error),
+    /// Guest memory: {0}
+    GuestMemory(GuestMemoryError),
     /// EventFd: {0}
     EventFd(std::io::Error),
+    /// Epoll: {0}
+    Epoll(std::io::Error),
     /// Cloning the backing file: {0}
     FileClone(std::io::Error),
     /// Spawning the IO worker thread: {0}
     Spawn(std::io::Error),
-    /// Too many requests in flight
-    QueueFull,
     /// The IO worker thread is gone
     WorkerGone,
+    /// Requests are served by the IO worker thread
+    ServedByWorker,
 }
 
-/// A finished request, as reported by the worker thread.
-#[derive(Debug)]
-pub struct ThreadedCompletion {
-    pub req: PendingRequest,
-    pub result: Result<u32, ThreadedIoError>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Read,
+    Write,
 }
 
-#[derive(Debug)]
-enum Io {
-    Read {
-        offset: u64,
-        mem: GuestMemoryMmap,
-        addr: GuestAddress,
-        count: u32,
-    },
-    Write {
-        offset: u64,
-        mem: GuestMemoryMmap,
-        addr: GuestAddress,
-        count: u32,
-    },
-    Flush,
-    Discard {
-        range: (u64, u32),
-    },
-}
-
-impl Io {
-    fn execute(self, file: &mut SyncFileEngine) -> Result<u32, SyncIoError> {
-        match self {
-            Io::Read {
-                offset,
-                mem,
-                addr,
-                count,
-            } => {
-                let count = file.read(offset, &mem, addr, count)?;
-                // The guest memory was written from this thread, so account for it in the dirty
-                // bitmap before the device gets to see the completion.
-                mem.mark_dirty(addr, count as usize);
-                Ok(count)
-            }
-            Io::Write {
-                offset,
-                mem,
-                addr,
-                count,
-            } => file.write(offset, &mem, addr, count),
-            Io::Flush => file.flush().map(|_| 0),
-            Io::Discard { range } => file.discard(range),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum Op {
-    Io {
-        io: Io,
-        req: PendingRequest,
-    },
-    /// Switch to a new backing file. Requests submitted before it use the old one.
-    UpdateFile(File),
-    /// Acknowledged once every request submitted before it has completed.
-    Barrier(mpsc::SyncSender<()>),
-    Exit,
-}
-
-/// Coalesces the completion eventfd writes of the worker thread.
-#[derive(Debug)]
-struct CompletionSignal {
-    evt: EventFd,
-    pending: bool,
-    last: Instant,
-}
-
-impl CompletionSignal {
-    fn new(evt: EventFd) -> Self {
-        CompletionSignal {
-            evt,
-            pending: false,
-            last: Instant::now(),
-        }
+/// Transfer `segments` from or to `file` at `offset` with positioned, vectored IO: one system
+/// call, unless the kernel transfers less than asked.
+fn transfer(
+    file: &File,
+    direction: Direction,
+    mut offset: u64,
+    mem: &GuestMemoryMmap,
+    segments: &[Segment],
+) -> Result<u32, ThreadedIoError> {
+    let mut iovecs = Vec::with_capacity(segments.len());
+    let mut total: u32 = 0;
+    for &(addr, len) in segments {
+        let slice = mem
+            .get_slice(addr, len as usize)
+            .map_err(ThreadedIoError::GuestMemory)?;
+        iovecs.push(libc::iovec {
+            iov_base: slice.ptr_guard_mut().as_ptr().cast(),
+            iov_len: len as usize,
+        });
+        total = total.checked_add(len).ok_or(ThreadedIoError::GuestMemory(
+            GuestMemoryError::GuestAddressOverflow,
+        ))?;
     }
 
-    /// Signal pending completions if the last signal is old enough.
-    fn maybe_flush(&mut self) {
-        if self.last.elapsed() >= COMPLETION_SIGNAL_DELAY {
-            self.flush();
-        }
-    }
+    let io_error = |err| match direction {
+        Direction::Read => ThreadedIoError::Read(err),
+        Direction::Write => ThreadedIoError::Write(err),
+    };
 
-    /// Signal pending completions.
-    fn flush(&mut self) {
-        if !self.pending {
-            return;
-        }
-        if let Err(err) = self.evt.write(1) {
-            error!("Failed to signal block IO completion: {:?}", err);
-        }
-        self.pending = false;
-        self.last = Instant::now();
-    }
-}
-
-fn run_worker(
-    mut file: SyncFileEngine,
-    ops: mpsc::Receiver<Op>,
-    completions: mpsc::Sender<ThreadedCompletion>,
-    completion_evt: EventFd,
-) {
-    if let Some(filter) = worker_seccomp_filter()
-        && let Err(err) = crate::seccomp::apply_filter(filter)
-    {
-        panic!("Failed to set the requested seccomp filters on the block IO worker: {err}");
-    }
-
-    let mut signal = CompletionSignal::new(completion_evt);
-    let mut next = None;
-    loop {
-        let op = match next.take() {
-            Some(op) => op,
-            None => {
-                // Never go to sleep on a completion the device has not been told about.
-                signal.flush();
-                match ops.recv() {
-                    Ok(op) => op,
-                    Err(mpsc::RecvError) => break,
+    let mut iovecs = iovecs.as_mut_slice();
+    while !iovecs.is_empty() {
+        let iovcnt = libc::c_int::try_from(iovecs.len()).unwrap_or(libc::c_int::MAX);
+        let offset_arg =
+            libc::off_t::try_from(offset).map_err(|_| io_error(libc::EOVERFLOW.into_io()))?;
+        // SAFETY: the iovecs point into guest memory that `mem`, which outlives the call, keeps
+        // mapped, each within the bounds `get_slice` checked.
+        let ret = unsafe {
+            match direction {
+                Direction::Read => {
+                    libc::preadv(file.as_raw_fd(), iovecs.as_ptr(), iovcnt, offset_arg)
+                }
+                Direction::Write => {
+                    libc::pwritev(file.as_raw_fd(), iovecs.as_ptr(), iovcnt, offset_arg)
                 }
             }
         };
-
-        let completion = match op {
-            Op::Io { io, req } => ThreadedCompletion {
-                req,
-                result: io.execute(&mut file).map_err(ThreadedIoError::Io),
-            },
-            Op::UpdateFile(new_file) => {
-                file.update_file(new_file);
-                continue;
+        let mut done = match usize::try_from(ret) {
+            Ok(0) => {
+                return Err(io_error(match direction {
+                    Direction::Read => std::io::ErrorKind::UnexpectedEof.into(),
+                    Direction::Write => std::io::ErrorKind::WriteZero.into(),
+                }));
             }
-            Op::Barrier(ack) => {
-                // The submitter may have given up waiting; nothing to do about it here.
-                let _ = ack.send(());
-                continue;
+            Ok(done) => done,
+            Err(_) => {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(io_error(err));
             }
-            Op::Exit => break,
         };
+        offset += done as u64;
 
-        if completions.send(completion).is_err() {
-            break;
-        }
-        signal.pending = true;
-
-        // Hold the signal back while more requests are queued, so that the device handles a
-        // burst of completions at once instead of raising an interrupt for each. Only while the
-        // previous signal is recent, though: a slow backing file gets one after every request.
-        match ops.try_recv() {
-            Ok(op) => {
-                next = Some(op);
-                signal.maybe_flush();
+        // Skip what was transferred: whole buffers first, then the start of the next one.
+        while let Some(first) = iovecs.first_mut() {
+            if done < first.iov_len {
+                // SAFETY: `done` is within the buffer.
+                first.iov_base = unsafe { first.iov_base.add(done) };
+                first.iov_len -= done;
+                break;
             }
-            Err(_) => signal.flush(),
+            done -= first.iov_len;
+            iovecs = &mut iovecs[1..];
         }
     }
-    signal.flush();
+
+    Ok(total)
+}
+
+trait IntoIoError {
+    fn into_io(self) -> std::io::Error;
+}
+
+impl IntoIoError for libc::c_int {
+    fn into_io(self) -> std::io::Error {
+        std::io::Error::from_raw_os_error(self)
+    }
+}
+
+/// What the worker needs to serve a device's queue, from its activation on.
+#[derive(Debug)]
+pub struct Serving {
+    /// The virtqueue. The worker owns it until it stops, and hands it back then.
+    pub queue: Queue,
+    /// The queue's eventfd. It stays the device's: the worker only waits on it, and stops before
+    /// the device closes it.
+    pub queue_evt: RawFd,
+    pub mem: GuestMemoryMmap,
+    pub interrupt: Arc<dyn VirtioInterrupt>,
+    pub metrics: Arc<BlockDeviceMetrics>,
+    pub nsectors: u64,
+    pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    pub drive_id: String,
+    /// Whether the guest negotiated discard.
+    pub discard: bool,
+}
+
+#[derive(Debug)]
+enum Control {
+    Start(Box<Serving>, Arc<Mutex<RateLimiter>>),
+    Stop,
+    Kick,
+    UpdateDisk {
+        /// The engine's new backing file, for the worker to duplicate. It stays open until the
+        /// worker replies.
+        fd: RawFd,
+        nsectors: u64,
+        image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    },
+    SyncAll,
+    Barrier,
+    Exit,
+}
+
+#[derive(Debug)]
+enum Reply {
+    Stopped(Option<Queue>),
+    Synced(Result<(), std::io::Error>),
+    Updated(Result<(), std::io::Error>),
+    Done,
+}
+
+// Epoll tokens.
+const CONTROL: u64 = 0;
+const QUEUE: u64 = 1;
+const RATE_LIMITER: u64 = 2;
+
+/// The worker's state while it serves the queue.
+#[derive(Debug)]
+struct Active {
+    queue: Queue,
+    queue_evt: ManuallyDrop<EventFd>,
+    mem: GuestMemoryMmap,
+    interrupt: Arc<dyn VirtioInterrupt>,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+    rate_limiter_fd: RawFd,
+    metrics: Arc<BlockDeviceMetrics>,
+    nsectors: u64,
+    image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    discard: bool,
+}
+
+#[derive(Debug)]
+struct Worker {
+    file: File,
+    epoll: Epoll,
+    control_evt: EventFd,
+    control: mpsc::Receiver<Control>,
+    replies: mpsc::Sender<Reply>,
+    active: Option<Active>,
+}
+
+impl Worker {
+    fn run(mut self) {
+        if let Some(filter) = worker_seccomp_filter()
+            && let Err(err) = crate::seccomp::apply_filter(filter)
+        {
+            panic!("Failed to set the requested seccomp filters on the block IO worker: {err}");
+        }
+
+        let mut events = [EpollEvent::default(); 4];
+        loop {
+            let count = match self.epoll.wait(-1, &mut events) {
+                Ok(count) => count,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    error!("Block IO worker failed to wait for events: {:?}", err);
+                    return;
+                }
+            };
+            for event in &events[..count] {
+                match event.data() {
+                    CONTROL => {
+                        let _ = self.control_evt.read();
+                        while let Ok(control) = self.control.try_recv() {
+                            if !self.handle(control) {
+                                return;
+                            }
+                        }
+                    }
+                    QUEUE => self.queue_event(),
+                    RATE_LIMITER => self.rate_limiter_event(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Handle a control message. Returns false when the worker has to exit.
+    fn handle(&mut self, control: Control) -> bool {
+        match control {
+            Control::Start(serving, rate_limiter) => self.start(*serving, rate_limiter),
+            Control::Stop => {
+                let queue = self.stop();
+                let _ = self.replies.send(Reply::Stopped(queue));
+            }
+            Control::Kick => self.process_queue(),
+            Control::UpdateDisk {
+                fd,
+                nsectors,
+                image_id,
+            } => {
+                // SAFETY: the engine keeps the fd open until it gets the reply.
+                let result = unsafe { BorrowedFd::borrow_raw(fd) }
+                    .try_clone_to_owned()
+                    .map(|fd| {
+                        self.file = File::from(fd);
+                        if let Some(active) = self.active.as_mut() {
+                            active.nsectors = nsectors;
+                            active.image_id = image_id;
+                        }
+                    });
+                let _ = self.replies.send(Reply::Updated(result));
+            }
+            Control::SyncAll => {
+                let _ = self.replies.send(Reply::Synced(self.file.sync_all()));
+            }
+            Control::Barrier => {
+                let _ = self.replies.send(Reply::Done);
+            }
+            Control::Exit => {
+                self.stop();
+                return false;
+            }
+        }
+        true
+    }
+
+    fn start(&mut self, serving: Serving, rate_limiter: Arc<Mutex<RateLimiter>>) {
+        let name = format!("{THREAD_NAME_PREFIX}{}", serving.drive_id);
+        let mut name = name.into_bytes();
+        name.truncate(15);
+        name.push(0);
+        // SAFETY: `name` is NUL terminated, and at most 16 bytes long, as PR_SET_NAME expects.
+        unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+
+        let rate_limiter_fd = rate_limiter
+            .lock()
+            .expect("Poisoned block rate limiter lock")
+            .as_raw_fd();
+        for (fd, token) in [(serving.queue_evt, QUEUE), (rate_limiter_fd, RATE_LIMITER)] {
+            if let Err(err) = self.epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                EpollEvent::new(EventSet::IN, token),
+            ) {
+                error!("Block IO worker failed to watch fd {}: {:?}", fd, err);
+            }
+        }
+
+        self.active = Some(Active {
+            queue: serving.queue,
+            // SAFETY: the fd is the device's, which keeps it open until it has stopped the
+            // worker. `ManuallyDrop` keeps the worker from closing it.
+            queue_evt: ManuallyDrop::new(unsafe { EventFd::from_raw_fd(serving.queue_evt) }),
+            mem: serving.mem,
+            interrupt: serving.interrupt,
+            rate_limiter,
+            rate_limiter_fd,
+            metrics: serving.metrics,
+            nsectors: serving.nsectors,
+            image_id: serving.image_id,
+            discard: serving.discard,
+        });
+        // Serve what the guest queued before the worker was watching.
+        self.process_queue();
+    }
+
+    /// Stop serving the queue, and return it.
+    fn stop(&mut self) -> Option<Queue> {
+        let active = self.active.take()?;
+        for fd in [active.queue_evt.as_raw_fd(), active.rate_limiter_fd] {
+            let _ = self
+                .epoll
+                .ctl(ControlOperation::Delete, fd, EpollEvent::default());
+        }
+        // Dropping the rest, the rate limiter included, before the device gets the queue.
+        Some(active.queue)
+    }
+
+    fn queue_event(&mut self) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        active.metrics.queue_event_count.inc();
+        if let Err(err) = active.queue_evt.read() {
+            error!("Failed to get queue event: {:?}", err);
+            active.metrics.event_fails.inc();
+        } else if active
+            .rate_limiter
+            .lock()
+            .expect("Poisoned block rate limiter lock")
+            .is_blocked()
+        {
+            active.metrics.rate_limiter_throttled_events.inc();
+        } else {
+            self.process_queue();
+        }
+    }
+
+    fn rate_limiter_event(&mut self) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        active.metrics.rate_limiter_event_count.inc();
+        let refilled = active
+            .rate_limiter
+            .lock()
+            .expect("Poisoned block rate limiter lock")
+            .event_handler()
+            .is_ok();
+        if refilled {
+            self.process_queue();
+        }
+    }
+
+    /// Serve every request available, until the queue is empty or the rate limiter blocks.
+    fn process_queue(&mut self) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        let mut used_any = false;
+
+        loop {
+            let head = match active.queue.pop_or_enable_notification() {
+                Ok(Some(head)) => head,
+                Ok(None) => break,
+                Err(err) => panic!("Block queue is corrupt: {err}"),
+            };
+            active
+                .metrics
+                .remaining_reqs_count
+                .add(active.queue.len().into());
+
+            let parsed = Request::parse(&head, &active.mem, active.nsectors);
+            let finished = match parsed {
+                Ok(request) => {
+                    let limited = request.rate_limit(
+                        &mut active
+                            .rate_limiter
+                            .lock()
+                            .expect("Poisoned block rate limiter lock"),
+                    );
+                    if limited {
+                        // Leave it in the avail ring until the rate limiter's timer fires.
+                        active.queue.undo_pop();
+                        active.metrics.rate_limiter_throttled_events.inc();
+                        break;
+                    }
+                    execute(&self.file, active, request, head.index)
+                }
+                Err(err) => {
+                    error!("Failed to parse available descriptor chain: {:?}", err);
+                    active.metrics.execute_fails.inc();
+                    FinishedRequest {
+                        num_bytes_to_mem: 0,
+                        desc_idx: head.index,
+                    }
+                }
+            };
+
+            used_any = true;
+            active
+                .queue
+                .add_used(finished.desc_idx, finished.num_bytes_to_mem)
+                .unwrap_or_else(|err| {
+                    error!(
+                        "Failed to add available descriptor head {}: {}",
+                        finished.desc_idx, err
+                    )
+                });
+        }
+        active.queue.advance_used_ring_idx();
+
+        if used_any && active.queue.prepare_kick() {
+            active
+                .interrupt
+                .trigger(VirtioInterruptType::Queue(0))
+                .unwrap_or_else(|_| {
+                    active.metrics.event_fails.inc();
+                });
+        }
+        if !used_any {
+            active.metrics.no_avail_buffer.inc();
+        }
+    }
+}
+
+/// Perform a request with blocking IO, write its status, and return what to put in the used
+/// ring.
+fn execute(file: &File, active: &Active, request: Request, desc_idx: u16) -> FinishedRequest {
+    let (mem, metrics) = (&active.mem, &*active.metrics);
+    let pending = request.to_pending_request(desc_idx);
+    let file_error = |err| IoErr::FileEngine(BlockIoError::Threaded(err));
+
+    let result = match request.r#type {
+        RequestType::In | RequestType::Out => {
+            let segments = [(request.data_addr, request.data_len)];
+            let offset = request.sector << SECTOR_SHIFT;
+            if request.r#type == RequestType::In {
+                let _metric = metrics.read_agg.record_latency_metrics();
+                let result = transfer(file, Direction::Read, offset, mem, &segments);
+                if result.is_ok() {
+                    // The guest memory was written from this thread, so account for it in the
+                    // dirty bitmap before the guest gets to see the completion.
+                    for &(addr, len) in &segments {
+                        mem.mark_dirty(addr, len as usize);
+                    }
+                }
+                result.map_err(file_error)
+            } else {
+                let _metric = metrics.write_agg.record_latency_metrics();
+                transfer(file, Direction::Write, offset, mem, &segments).map_err(file_error)
+            }
+        }
+        // Sync data out to physical media on host.
+        RequestType::Flush => file
+            .sync_all()
+            .map(|_| 0)
+            .map_err(|err| file_error(ThreadedIoError::SyncAll(err))),
+        // Parsing turned the request's range into a byte offset and length.
+        RequestType::Discard if active.discard => {
+            file_discard_range(file, (request.sector, request.data_len))
+                .map_err(|err| file_error(ThreadedIoError::Discard(err)))
+        }
+        RequestType::Discard => Err(IoErr::UnsupportedRequest(VIRTIO_BLK_T_DISCARD)),
+        RequestType::GetDeviceID => mem
+            .write_slice(&active.image_id, request.data_addr)
+            .map(|_| VIRTIO_BLK_ID_BYTES)
+            .map_err(IoErr::GetId),
+        RequestType::Unsupported(_) => Ok(0),
+    };
+
+    pending.finish(mem, result, metrics)
 }
 
 /// Front end of the threaded engine, used from the thread that owns the device.
 #[derive(Debug)]
 pub struct ThreadedFileEngine {
+    control: mpsc::Sender<Control>,
+    control_evt: EventFd,
+    replies: mpsc::Receiver<Reply>,
+    // While the worker serves the queue: the rate limiter it shares with the device.
+    rate_limiter: Option<Arc<Mutex<RateLimiter>>>,
+    // Takes the device's rate limiter's place while the worker has it. Made here, before the VMM
+    // thread's seccomp filter forbids creating the timerfd a rate limiter needs.
+    spare_rate_limiter: Option<RateLimiter>,
+    // A new backing file, until the device hands it over with its properties.
+    new_file: Option<File>,
+    // The backing file. The worker serves requests with its own duplicate of it.
     file: File,
-    ops: mpsc::Sender<Op>,
-    completions: mpsc::Receiver<ThreadedCompletion>,
-    completion_evt: EventFd,
-    in_flight: usize,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl ThreadedFileEngine {
     pub fn from_file(file: File) -> Result<ThreadedFileEngine, ThreadedIoError> {
-        let completion_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(ThreadedIoError::EventFd)?;
-        let worker_evt = completion_evt
-            .try_clone()
-            .map_err(ThreadedIoError::EventFd)?;
-        let worker_file =
-            SyncFileEngine::from_file(file.try_clone().map_err(ThreadedIoError::FileClone)?);
-        let (ops, worker_ops) = mpsc::channel();
-        let (worker_completions, completions) = mpsc::channel();
+        let control_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(ThreadedIoError::EventFd)?;
+        let worker_control_evt = control_evt.try_clone().map_err(ThreadedIoError::EventFd)?;
+        // Before the worker applies its seccomp filter, which does not allow creating it.
+        let epoll = Epoll::new().map_err(ThreadedIoError::Epoll)?;
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                worker_control_evt.as_raw_fd(),
+                EpollEvent::new(EventSet::IN, CONTROL),
+            )
+            .map_err(ThreadedIoError::Epoll)?;
+        // Before the VMM thread's seccomp filter, which does not allow duplicating it.
+        let worker_file = file.try_clone().map_err(ThreadedIoError::FileClone)?;
+        let (control, worker_control) = mpsc::channel();
+        let (worker_replies, replies) = mpsc::channel();
 
+        let worker = Worker {
+            file: worker_file,
+            epoll,
+            control_evt: worker_control_evt,
+            control: worker_control,
+            replies: worker_replies,
+            active: None,
+        };
         let worker = thread::Builder::new()
             .name("fc_blk_io".to_string())
-            .spawn(move || run_worker(worker_file, worker_ops, worker_completions, worker_evt))
+            .spawn(move || worker.run())
             .map_err(ThreadedIoError::Spawn)?;
 
         Ok(ThreadedFileEngine {
+            control,
+            control_evt,
+            replies,
+            rate_limiter: None,
+            spare_rate_limiter: Some(RateLimiter::default()),
+            new_file: None,
             file,
-            ops,
-            completions,
-            completion_evt,
-            in_flight: 0,
             worker: Some(worker),
         })
     }
 
+    /// The backing file.
     pub fn file(&self) -> &File {
         &self.file
     }
 
-    /// Update the backing file of the engine
-    pub fn update_file(&mut self, file: File) -> Result<(), ThreadedIoError> {
-        let worker_file = file.try_clone().map_err(ThreadedIoError::FileClone)?;
-        self.ops
-            .send(Op::UpdateFile(worker_file))
+    fn send(&self, control: Control) -> Result<(), ThreadedIoError> {
+        self.control
+            .send(control)
             .map_err(|_| ThreadedIoError::WorkerGone)?;
-        self.file = file;
+        self.control_evt.write(1).map_err(ThreadedIoError::EventFd)
+    }
+
+    fn reply(&self) -> Result<Reply, ThreadedIoError> {
+        self.replies.recv().map_err(|_| ThreadedIoError::WorkerGone)
+    }
+
+    /// Whether the worker serves the device's queue.
+    pub fn is_serving(&self) -> bool {
+        self.rate_limiter.is_some()
+    }
+
+    /// Hand the device's queue and rate limiter to the worker, which serves the queue from then
+    /// on. The device gets a spare rate limiter in exchange, until [`Self::stop`].
+    pub fn start(
+        &mut self,
+        serving: Serving,
+        device_rate_limiter: &mut RateLimiter,
+    ) -> Result<(), ThreadedIoError> {
+        let Some(mut spare) = self.spare_rate_limiter.take() else {
+            // Already serving.
+            return Ok(());
+        };
+        std::mem::swap(device_rate_limiter, &mut spare);
+        let rate_limiter = Arc::new(Mutex::new(spare));
+        self.send(Control::Start(Box::new(serving), rate_limiter.clone()))?;
+        self.rate_limiter = Some(rate_limiter);
         Ok(())
     }
 
-    pub fn completion_evt(&self) -> &EventFd {
-        &self.completion_evt
+    /// Have the worker stop serving the queue. Returns the queue, which the device gets back,
+    /// and puts its rate limiter back.
+    pub fn stop(
+        &mut self,
+        device_rate_limiter: &mut RateLimiter,
+    ) -> Result<Option<Queue>, ThreadedIoError> {
+        let Some(rate_limiter) = self.rate_limiter.take() else {
+            return Ok(None);
+        };
+        self.send(Control::Stop)?;
+        let queue = match self.reply()? {
+            Reply::Stopped(queue) => queue,
+            reply => panic!("Unexpected block IO worker reply to stop: {reply:?}"),
+        };
+        // The worker dropped its reference before replying.
+        let mut rate_limiter = Arc::try_unwrap(rate_limiter)
+            .expect("Block IO worker kept the rate limiter")
+            .into_inner()
+            .expect("Poisoned block rate limiter lock");
+        std::mem::swap(device_rate_limiter, &mut rate_limiter);
+        self.spare_rate_limiter = Some(rate_limiter);
+        Ok(queue)
     }
 
-    fn push(&mut self, io: Io, req: PendingRequest) -> Result<(), RequestError<ThreadedIoError>> {
-        if self.in_flight >= THREADED_IO_MAX_IN_FLIGHT {
-            return Err(RequestError {
-                req,
-                error: ThreadedIoError::QueueFull,
-            });
-        }
+    /// Have the worker look at the queue, as if the guest had notified it.
+    pub fn kick(&self) -> Result<(), ThreadedIoError> {
+        self.send(Control::Kick)
+    }
 
-        match self.ops.send(Op::Io { io, req }) {
-            Ok(()) => {
-                self.in_flight += 1;
+    /// The rate limiter the worker uses, while it serves the queue.
+    pub fn rate_limiter(&self) -> Option<&Arc<Mutex<RateLimiter>>> {
+        self.rate_limiter.as_ref()
+    }
+
+    /// Update the rate limiter the worker uses. Returns the updates back when the worker does
+    /// not serve the queue, for the device to apply to its own.
+    pub fn update_rate_limiter(
+        &self,
+        bytes: BucketUpdate,
+        ops: BucketUpdate,
+    ) -> Option<(BucketUpdate, BucketUpdate)> {
+        match self.rate_limiter.as_ref() {
+            Some(rate_limiter) => {
+                rate_limiter
+                    .lock()
+                    .expect("Poisoned block rate limiter lock")
+                    .update_buckets(bytes, ops);
+                None
+            }
+            None => Some((bytes, ops)),
+        }
+    }
+
+    /// Take a new backing file. The worker switches to it with [`Self::update_disk`].
+    pub fn update_file(&mut self, file: File) -> Result<(), ThreadedIoError> {
+        // The worker duplicates it: the VMM thread's seccomp filter does not allow that after
+        // boot.
+        self.new_file = Some(file);
+        Ok(())
+    }
+
+    /// Switch the worker to the backing file given to [`Self::update_file`], with its size and
+    /// id, at once. Requests the worker served before use the old file, later ones the new one.
+    pub fn update_disk(
+        &mut self,
+        nsectors: u64,
+        image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    ) -> Result<(), ThreadedIoError> {
+        let Some(file) = self.new_file.take() else {
+            return Ok(());
+        };
+        self.send(Control::UpdateDisk {
+            fd: file.as_raw_fd(),
+            nsectors,
+            image_id,
+        })?;
+        match self.reply()? {
+            Reply::Updated(result) => {
+                result.map_err(ThreadedIoError::FileClone)?;
+                self.file = file;
                 Ok(())
             }
-            Err(mpsc::SendError(Op::Io { req, .. })) => Err(RequestError {
-                req,
-                error: ThreadedIoError::WorkerGone,
-            }),
-            Err(_) => unreachable!("sent an IO op"),
+            reply => panic!("Unexpected block IO worker reply to a disk update: {reply:?}"),
         }
     }
 
-    pub fn push_read(
-        &mut self,
-        offset: u64,
-        mem: &GuestMemoryMmap,
-        addr: GuestAddress,
-        count: u32,
-        req: PendingRequest,
-    ) -> Result<(), RequestError<ThreadedIoError>> {
-        let io = Io::Read {
-            offset,
-            mem: mem.clone(),
-            addr,
-            count,
-        };
-        self.push(io, req)
-    }
-
-    pub fn push_write(
-        &mut self,
-        offset: u64,
-        mem: &GuestMemoryMmap,
-        addr: GuestAddress,
-        count: u32,
-        req: PendingRequest,
-    ) -> Result<(), RequestError<ThreadedIoError>> {
-        let io = Io::Write {
-            offset,
-            mem: mem.clone(),
-            addr,
-            count,
-        };
-        self.push(io, req)
-    }
-
-    pub fn push_flush(&mut self, req: PendingRequest) -> Result<(), RequestError<ThreadedIoError>> {
-        self.push(Io::Flush, req)
-    }
-
-    pub fn push_discard(
-        &mut self,
-        range: (u64, u32),
-        req: PendingRequest,
-    ) -> Result<(), RequestError<ThreadedIoError>> {
-        self.push(Io::Discard { range }, req)
-    }
-
-    /// Pop a finished request, if there is one.
-    pub fn pop(&mut self) -> Option<ThreadedCompletion> {
-        let completion = self.completions.try_recv().ok()?;
-        self.in_flight -= 1;
-        Some(completion)
-    }
-
-    /// Wait for every submitted request to complete. Their completions are left to be popped,
-    /// unless `discard` is set.
-    pub fn drain(&mut self, discard: bool) -> Result<(), ThreadedIoError> {
-        if self.in_flight > 0 {
-            let (ack, done) = mpsc::sync_channel(1);
-            self.ops
-                .send(Op::Barrier(ack))
-                .map_err(|_| ThreadedIoError::WorkerGone)?;
-            done.recv().map_err(|_| ThreadedIoError::WorkerGone)?;
+    /// Wait for the worker to finish the request it is serving, if any.
+    pub fn drain(&mut self, _discard: bool) -> Result<(), ThreadedIoError> {
+        self.send(Control::Barrier)?;
+        match self.reply()? {
+            Reply::Done => Ok(()),
+            reply => panic!("Unexpected block IO worker reply to a barrier: {reply:?}"),
         }
-
-        if discard {
-            while self.pop().is_some() {}
-        }
-
-        Ok(())
     }
 
-    pub fn drain_and_flush(&mut self, discard: bool) -> Result<(), ThreadedIoError> {
-        self.drain(discard)?;
+    pub fn drain_and_flush(&mut self, _discard: bool) -> Result<(), ThreadedIoError> {
+        // Sync data out to physical media on host, from the worker, which has the backing file.
+        // It finishes what it is serving first.
+        self.send(Control::SyncAll)?;
+        match self.reply()? {
+            Reply::Synced(result) => result.map_err(ThreadedIoError::SyncAll),
+            reply => panic!("Unexpected block IO worker reply to a sync: {reply:?}"),
+        }
+    }
 
-        // Sync data out to physical media on host. The worker holds no data of its own, so the
-        // file descriptor here reaches everything it wrote.
-        self.file
-            .sync_all()
-            .map_err(|err| ThreadedIoError::Io(SyncIoError::SyncAll(err)))
+    /// Requests are served by the worker, from the queue. Should one get here, it fails.
+    pub fn refuse(req: PendingRequest) -> RequestError<ThreadedIoError> {
+        RequestError {
+            req,
+            error: ThreadedIoError::ServedByWorker,
+        }
     }
 }
 
 impl Drop for ThreadedFileEngine {
     fn drop(&mut self) {
-        // The worker only exits once it gets here, so everything submitted before is finished.
-        let _ = self.ops.send(Op::Exit);
+        let _ = self.send(Control::Exit);
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
@@ -404,20 +766,15 @@ impl Drop for ThreadedFileEngine {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-
-    use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+    use vm_memory::GuestMemoryRegion;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::utils::u64_to_usize;
     use crate::vmm_config::machine_config::HugePageConfig;
     use crate::vstate::memory;
-    use crate::vstate::memory::{Bitmap, Bytes, GuestRegionMmapExt};
+    use crate::vstate::memory::{Bitmap, GuestRegionMmapExt};
 
-    const FILE_LEN: u32 = 1024;
-    // 2 pages of memory should be enough to test read/write ops and also dirty tracking.
     const MEM_LEN: usize = 8192;
 
     fn create_mem() -> GuestMemoryMmap {
@@ -435,259 +792,100 @@ mod tests {
         .unwrap()
     }
 
-    fn check_dirty_mem(mem: &GuestMemoryMmap, addr: GuestAddress, len: u32, dirty: bool) {
-        let bitmap = mem.find_region(addr).unwrap().bitmap();
-        for offset in addr.0..addr.0 + u64::from(len) {
-            assert_eq!(bitmap.dirty_at(u64_to_usize(offset)), dirty);
-        }
-    }
-
-    fn new_engine() -> ThreadedFileEngine {
-        ThreadedFileEngine::from_file(TempFile::new().unwrap().into_file()).unwrap()
-    }
-
-    fn assert_completed(engine: &mut ThreadedFileEngine, count: u32) {
-        engine.drain(false).unwrap();
-        assert_eq!(engine.pop().unwrap().result.unwrap(), count);
-    }
-
-    fn wait_for_signal(engine: &ThreadedFileEngine) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.completion_evt().read().is_err() {
-            assert!(Instant::now() < deadline, "completion never signalled");
-            thread::sleep(Duration::from_millis(1));
-        }
+    fn is_dirty(mem: &GuestMemoryMmap, addr: GuestAddress) -> bool {
+        mem.find_region(addr)
+            .unwrap()
+            .bitmap()
+            .dirty_at(u64_to_usize(addr.0))
     }
 
     #[test]
-    fn test_read_write_flush() {
-        let mut engine = new_engine();
-        let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
-            .as_bytes()
-            .to_vec();
+    fn test_transfer() {
+        let file = TempFile::new().unwrap().into_file();
+        let data: Vec<u8> = (0..3072u32).map(|i| (i % 251) as u8).collect();
 
-        // Partial write and read, at the end of guest memory.
-        let partial_len = 50;
-        let addr = GuestAddress(MEM_LEN as u64 - u64::from(partial_len));
+        // Write three buffers that are neither adjacent nor in order in guest memory.
         let mem = create_mem();
-        mem.write(&data, addr).unwrap();
-        engine
-            .push_write(0, &mem, addr, partial_len, PendingRequest::default())
-            .unwrap();
-        assert_completed(&mut engine, partial_len);
-        let mem = create_mem();
-        engine
-            .push_read(0, &mem, addr, partial_len, PendingRequest::default())
-            .unwrap();
-        assert_completed(&mut engine, partial_len);
-        let mut buf = vec![0u8; partial_len as usize];
-        mem.read_slice(&mut buf, addr).unwrap();
-        assert_eq!(buf, data[..partial_len as usize]);
+        mem.write_slice(&data[..1024], GuestAddress(4096)).unwrap();
+        mem.write_slice(&data[1024..1536], GuestAddress(0)).unwrap();
+        mem.write_slice(&data[1536..], GuestAddress(2048)).unwrap();
+        let segments = [
+            (GuestAddress(4096), 1024),
+            (GuestAddress(0), 512),
+            (GuestAddress(2048), 1536),
+        ];
+        assert_eq!(
+            transfer(&file, Direction::Write, 512, &mem, &segments).unwrap(),
+            3072
+        );
 
-        // Full write and read, at an offset.
+        // Read them back into different buffers.
         let mem = create_mem();
-        mem.write(&data, GuestAddress(0)).unwrap();
-        engine
-            .push_write(
-                100,
-                &mem,
-                GuestAddress(0),
-                FILE_LEN,
-                PendingRequest::default(),
-            )
+        let segments = [(GuestAddress(1024), 2048), (GuestAddress(6144), 1024)];
+        assert_eq!(
+            transfer(&file, Direction::Read, 512, &mem, &segments).unwrap(),
+            3072
+        );
+        let mut buf = vec![0u8; 3072];
+        mem.read_slice(&mut buf[..2048], GuestAddress(1024))
             .unwrap();
-        assert_completed(&mut engine, FILE_LEN);
-        let mem = create_mem();
-        engine
-            .push_read(
-                100,
-                &mem,
-                GuestAddress(0),
-                FILE_LEN,
-                PendingRequest::default(),
-            )
+        mem.read_slice(&mut buf[2048..], GuestAddress(6144))
             .unwrap();
-        assert_completed(&mut engine, FILE_LEN);
-        let mut buf = vec![0u8; FILE_LEN as usize];
-        mem.read_slice(&mut buf, GuestAddress(0)).unwrap();
         assert_eq!(buf, data);
+    }
 
-        // Reads from the worker thread are accounted for in the dirty bitmap.
-        check_dirty_mem(&mem, GuestAddress(0), FILE_LEN, true);
-        check_dirty_mem(&mem, GuestAddress(4096), 4096, false);
+    #[test]
+    fn test_transfer_errors() {
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let mem = create_mem();
 
-        // Out of bounds guest memory fails the request, not the engine.
-        engine
-            .push_read(
-                0,
-                &mem,
-                GuestAddress(MEM_LEN as u64),
-                FILE_LEN,
-                PendingRequest::default(),
-            )
-            .unwrap();
-        engine.drain(false).unwrap();
+        // One bad buffer fails the whole request, before any of it is transferred.
+        let segments = [(GuestAddress(0), 512), (GuestAddress(MEM_LEN as u64), 512)];
         assert!(matches!(
-            engine.pop().unwrap().result,
-            Err(ThreadedIoError::Io(SyncIoError::Transfer(_)))
+            transfer(&file, Direction::Read, 0, &mem, &segments),
+            Err(ThreadedIoError::GuestMemory(_))
         ));
+        assert!(!is_dirty(&mem, GuestAddress(0)));
 
-        engine.push_flush(PendingRequest::default()).unwrap();
-        assert_completed(&mut engine, 0);
-        engine.drain_and_flush(true).unwrap();
-    }
-
-    #[test]
-    fn test_discard() {
-        use std::io::{Read, Seek, SeekFrom, Write};
-
-        let mut file = TempFile::new().unwrap().into_file();
-        file.write_all(&[0x5a; 4096]).unwrap();
-        let mut engine = ThreadedFileEngine::from_file(file.try_clone().unwrap()).unwrap();
-
-        engine
-            .push_discard((1024, 2048), PendingRequest::default())
-            .unwrap();
-        engine.drain(false).unwrap();
-        match engine.pop().unwrap().result {
-            Ok(discarded) => assert_eq!(discarded, 2048),
-            // Some filesystems cannot punch holes; that is the host's limitation, and the
-            // request still completes through the worker.
-            Err(ThreadedIoError::Io(SyncIoError::Discard(err)))
-                if matches!(
-                    err.raw_os_error(),
-                    Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)
-                ) =>
-            {
-                return;
-            }
-            Err(err) => panic!("discard failed: {err}"),
-        }
-
-        let mut data = vec![0u8; 4096];
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.read_exact(&mut data).unwrap();
-        assert_eq!(&data[..1024], [0x5a; 1024].as_slice());
-        assert_eq!(&data[1024..3072], [0; 2048].as_slice());
-        assert_eq!(&data[3072..], [0x5a; 1024].as_slice());
-    }
-
-    #[test]
-    fn test_completions_are_signalled() {
-        let mem = create_mem();
-        let mut engine = new_engine();
-
-        // Submitting returns before the IO is done: completions only show up through the
-        // completion eventfd, once the worker has finished them.
-        for _ in 0..10 {
-            engine
-                .push_write(
-                    0,
-                    &mem,
-                    GuestAddress(0),
-                    FILE_LEN,
-                    PendingRequest::default(),
-                )
-                .unwrap();
-        }
-        let mut completed = 0;
-        while completed < 10 {
-            wait_for_signal(&engine);
-            while let Some(completion) = engine.pop() {
-                assert_eq!(completion.result.unwrap(), FILE_LEN);
-                completed += 1;
-            }
-        }
-        assert!(engine.pop().is_none());
-    }
-
-    #[test]
-    fn test_signal_before_idle() {
-        let mem = create_mem();
-        let mut engine = new_engine();
-
-        // Queue ops that complete nothing behind a request: the worker must still signal the
-        // request's completion before it goes idle.
-        engine
-            .push_write(
-                0,
+        // Reading past the end of the file is an error, not a short read.
+        assert!(matches!(
+            transfer(
+                &file,
+                Direction::Read,
+                3584,
                 &mem,
-                GuestAddress(0),
-                FILE_LEN,
-                PendingRequest::default(),
-            )
-            .unwrap();
-        engine
-            .update_file(TempFile::new().unwrap().into_file())
-            .unwrap();
-
-        wait_for_signal(&engine);
-        assert_eq!(engine.pop().unwrap().result.unwrap(), FILE_LEN);
+                &[(GuestAddress(0), 1024)]
+            ),
+            Err(ThreadedIoError::Read(_))
+        ));
     }
 
     #[test]
-    fn test_throttling() {
-        let mut engine = new_engine();
-
-        for _ in 0..THREADED_IO_MAX_IN_FLIGHT {
-            engine.push_flush(PendingRequest::default()).unwrap();
-        }
-        // Completed but not yet popped requests still count as in flight.
-        engine.drain(false).unwrap();
-        let err = engine.push_flush(PendingRequest::default()).unwrap_err();
-        assert!(matches!(err.error, ThreadedIoError::QueueFull));
-
-        // Popping a completion makes room for one more request.
-        engine.pop().unwrap();
-        engine.push_flush(PendingRequest::default()).unwrap();
-        let err = engine.push_flush(PendingRequest::default()).unwrap_err();
-        assert!(matches!(err.error, ThreadedIoError::QueueFull));
-
-        // Discarding all completions makes room for all of them.
-        engine.drain(true).unwrap();
-        assert!(engine.pop().is_none());
-        for _ in 0..THREADED_IO_MAX_IN_FLIGHT {
-            engine.push_flush(PendingRequest::default()).unwrap();
-        }
-        engine.drain(true).unwrap();
-    }
-
-    #[test]
-    fn test_update_file() {
-        let mem = create_mem();
+    fn test_engine_before_activation() {
         let old = TempFile::new().unwrap();
         let new = TempFile::new().unwrap();
         let mut engine = ThreadedFileEngine::from_file(old.as_file().try_clone().unwrap()).unwrap();
+        assert!(!engine.is_serving());
+        assert!(engine.rate_limiter().is_none());
 
-        let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
-            .as_bytes()
-            .to_vec();
-        mem.write(&data, GuestAddress(0)).unwrap();
-
-        // Requests submitted before the update go to the old file, the ones after to the new one,
-        // without waiting for the first to complete.
-        engine
-            .push_write(
-                0,
-                &mem,
-                GuestAddress(0),
-                FILE_LEN,
-                PendingRequest::default(),
-            )
-            .unwrap();
+        // Without a queue to serve, the worker still answers, and takes a new backing file.
+        engine.drain(true).unwrap();
+        engine.drain_and_flush(true).unwrap();
         engine
             .update_file(new.as_file().try_clone().unwrap())
             .unwrap();
         engine
-            .push_write(0, &mem, GuestAddress(0), 10, PendingRequest::default())
+            .update_disk(0, [0; VIRTIO_BLK_ID_BYTES as usize])
             .unwrap();
-        engine.drain(true).unwrap();
+        engine.drain(false).unwrap();
 
-        assert_eq!(old.as_file().metadata().unwrap().len(), u64::from(FILE_LEN));
-        assert_eq!(new.as_file().metadata().unwrap().len(), 10);
-        assert_eq!(
-            engine.file().metadata().unwrap().ino(),
-            new.as_file().metadata().unwrap().ino()
-        );
+        // Rate limiter updates are the device's to apply.
+        let updates = engine.update_rate_limiter(BucketUpdate::None, BucketUpdate::Disabled);
+        assert!(updates.is_some());
+
+        // Stopping a worker that serves nothing returns nothing.
+        let mut rate_limiter = RateLimiter::default();
+        assert!(engine.stop(&mut rate_limiter).unwrap().is_none());
     }
 }
