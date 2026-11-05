@@ -1486,6 +1486,97 @@
                         "comment": "PR_SET_NAME"
                     }
                 ]
+            },
+            {
+                "syscall": "socket",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "libc::AF_UNIX"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 524289,
+                        "comment": "libc::SOCK_STREAM | libc::SOCK_CLOEXEC"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
+                    }
+                ],
+                "comment": "The NBD engine's worker reconnects to its server's Unix socket"
+            },
+            {
+                "syscall": "connect",
+                "comment": "The NBD engine's worker reconnects to its server's Unix socket"
+            },
+            {
+                "syscall": "setsockopt",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "libc::SOL_SOCKET"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 20,
+                        "comment": "libc::SO_RCVTIMEO"
+                    }
+                ],
+                "comment": "Bounds the NBD engine's handshake when it reconnects"
+            },
+            {
+                "syscall": "setsockopt",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "libc::SOL_SOCKET"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 21,
+                        "comment": "libc::SO_SNDTIMEO"
+                    }
+                ],
+                "comment": "Bounds the NBD engine's handshake when it reconnects"
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 21537,
+                        "comment": "FIONBIO"
+                    }
+                ],
+                "comment": "Makes the NBD engine's socket non-blocking after its handshake"
+            },
+            {
+                "syscall": "readv",
+                "comment": "The NBD engine reads replies straight into a request's buffers"
+            },
+            {
+                "syscall": "writev",
+                "comment": "The NBD engine sends requests, with their buffers, in one call"
             }
         ]
     }

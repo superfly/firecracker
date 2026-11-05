@@ -130,10 +130,10 @@ impl Request {
 }
 
 impl VirtioBlock {
-    /// Features only the threaded engine offers.
+    /// Features only the engines whose worker serves the queue offer.
     pub(super) fn threaded_features(engine_type: FileEngineType) -> u64 {
         match engine_type {
-            FileEngineType::Threaded => 1u64 << VIRTIO_BLK_F_SEG_MAX,
+            FileEngineType::Threaded | FileEngineType::Nbd => 1u64 << VIRTIO_BLK_F_SEG_MAX,
             _ => 0,
         }
     }
@@ -142,7 +142,7 @@ impl VirtioBlock {
     /// by what the driver accepted: a driver that did not accept it sends one buffer anyway.
     pub(super) fn accepts_segments(&self) -> bool {
         self.avail_features & (1u64 << VIRTIO_BLK_F_SEG_MAX) != 0
-            && matches!(self.disk.file_engine, FileEngine::Threaded(_))
+            && self.disk.file_engine.queue_worker().is_some()
     }
 
     /// Serve a config space read from the longer config space of a device that takes several
@@ -170,7 +170,7 @@ impl VirtioBlock {
     /// Hand the queue to the worker, which serves it from then on. Called once the device is
     /// activated, and again after `threaded_stop`, when the device is kicked.
     pub(super) fn threaded_start(&mut self) {
-        let FileEngine::Threaded(engine) = &self.disk.file_engine else {
+        let Some(engine) = self.disk.file_engine.queue_worker() else {
             return;
         };
         if engine.is_serving() {
@@ -192,7 +192,7 @@ impl VirtioBlock {
             segmented: self.accepts_segments(),
             drive_id: self.id.clone(),
         };
-        let FileEngine::Threaded(engine) = &mut self.disk.file_engine else {
+        let Some(engine) = self.disk.file_engine.queue_worker_mut() else {
             return;
         };
         if let Err(err) = engine.start(serving, &mut self.rate_limiter) {
@@ -204,20 +204,31 @@ impl VirtioBlock {
     /// Take the queue and the rate limiter back from the worker, for the device to save them,
     /// or before it goes away.
     pub(super) fn threaded_stop(&mut self) {
-        let FileEngine::Threaded(engine) = &mut self.disk.file_engine else {
-            return;
+        if let Err(err) = self.threaded_try_stop() {
+            error!("Failed to stop the block IO worker: {:?}", err);
+        }
+    }
+
+    /// As `threaded_stop`, but returns the error. With the NBD engine, the worker then still
+    /// serves the queue.
+    pub(super) fn threaded_try_stop(&mut self) -> Result<(), VirtioBlockError> {
+        let Some(engine) = self.disk.file_engine.queue_worker_mut() else {
+            return Ok(());
         };
         match engine.stop(&mut self.rate_limiter) {
-            Ok(Some(queue)) => self.queues[0] = queue,
-            Ok(None) => {}
-            Err(err) => error!("Failed to stop the block IO worker: {:?}", err),
+            Ok(Some(queue)) => {
+                self.queues[0] = queue;
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(err) => Err(VirtioBlockError::FileEngine(err)),
         }
     }
 
     /// Have the worker look at the queue, starting it if it is not serving. Returns false if the
-    /// device does not use the threaded engine.
+    /// device's queue is not served by a worker.
     pub(super) fn threaded_kick(&mut self) -> bool {
-        let FileEngine::Threaded(engine) = &self.disk.file_engine else {
+        let Some(engine) = self.disk.file_engine.queue_worker() else {
             return false;
         };
         if !engine.is_serving() {
@@ -231,9 +242,7 @@ impl VirtioBlock {
 
     /// The configuration of the rate limiter the worker uses, while it serves the queue.
     pub(super) fn threaded_rate_limiter_config(&self) -> Option<RateLimiterConfig> {
-        let FileEngine::Threaded(engine) = &self.disk.file_engine else {
-            return None;
-        };
+        let engine = self.disk.file_engine.queue_worker()?;
         let rate_limiter = engine.rate_limiter()?;
         let rate_limiter = rate_limiter
             .lock()
@@ -248,9 +257,9 @@ impl VirtioBlock {
         bytes: BucketUpdate,
         ops: BucketUpdate,
     ) -> Option<(BucketUpdate, BucketUpdate)> {
-        match &self.disk.file_engine {
-            FileEngine::Threaded(engine) => engine.update_rate_limiter(bytes, ops),
-            _ => Some((bytes, ops)),
+        match self.disk.file_engine.queue_worker() {
+            Some(engine) => engine.update_rate_limiter(bytes, ops),
+            None => Some((bytes, ops)),
         }
     }
 
@@ -735,6 +744,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::Threaded,
+            nbd: None,
         })
         .unwrap();
 

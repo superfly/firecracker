@@ -144,6 +144,8 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Cannot get a block device ready for the snapshot: {0}
+    BlockQuiesce(crate::devices::virtio::block::BlockError),
 }
 
 /// Snapshot version
@@ -155,6 +157,11 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // Before any state is saved: a block device that cannot get its requests in flight done
+    // and flushed fails the snapshot, rather than leave them out of it.
+    vmm.device_manager
+        .quiesce_block_devices()
+        .map_err(CreateSnapshotError::BlockQuiesce)?;
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;

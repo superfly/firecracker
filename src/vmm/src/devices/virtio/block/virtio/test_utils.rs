@@ -58,6 +58,7 @@ pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -
             }),
         }),
         file_engine_type,
+        nbd: None,
     };
 
     // The default block device is read-write and non-root.
@@ -123,7 +124,7 @@ pub fn simulate_queue_and_async_completion_events(b: &mut VirtioBlock, expected_
             simulate_queue_event(b, Some(expected_irq));
         }
         // The threaded engine's worker serves its queue on its own.
-        FileEngine::Threaded(_) => {
+        FileEngine::Threaded(_) | FileEngine::Nbd(_) => {
             simulate_queue_event(b, Some(expected_irq));
         }
     }

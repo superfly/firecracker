@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::RateLimiterConfig;
 use crate::VmmError;
 use crate::devices::virtio::block::device::Block;
+pub use crate::devices::virtio::block::virtio::NbdBackendConfig;
 pub use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::{BlockError, CacheType};
 
@@ -64,6 +65,11 @@ pub struct BlockDeviceConfig {
     // VhostUserBlock specific fields
     /// Path to the vhost-user socket.
     pub socket: Option<String>,
+
+    // NBD engine specific fields
+    /// The NBD server, on a Unix socket, that serves the drive with the Nbd IO engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbd: Option<NbdBackendConfig>,
 }
 
 /// Only provided fields will be updated. I.e. if any optional fields
@@ -214,6 +220,7 @@ mod tests {
                 file_engine_type: self.file_engine_type,
 
                 socket: self.socket.clone(),
+                nbd: self.nbd.clone(),
             }
         }
     }
@@ -241,6 +248,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -275,6 +283,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -307,6 +316,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -336,6 +346,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -352,6 +363,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -379,6 +391,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -395,6 +408,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -411,6 +425,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -452,6 +467,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -468,6 +484,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -484,6 +501,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -526,6 +544,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -542,6 +561,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -614,6 +634,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
         // Switch roots and add a PARTUUID for the new one.
         let mut root_block_device_old = root_block_device;
@@ -630,6 +651,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         block_devs.insert(root_block_device_old, false).unwrap();
@@ -656,6 +678,7 @@ mod tests {
             file_engine_type: Some(FileEngineType::Sync),
 
             socket: None,
+            nbd: None,
         };
 
         let mut block_devs = BlockBuilder::new();
@@ -686,6 +709,7 @@ mod tests {
             file_engine_type: None,
 
             socket: None,
+            nbd: None,
         };
 
         let block = Block::new(config).unwrap();

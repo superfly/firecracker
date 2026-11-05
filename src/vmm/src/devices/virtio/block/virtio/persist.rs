@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::device::DiskProperties;
+use super::io::NbdBackendConfig;
 use super::*;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
@@ -32,6 +33,8 @@ pub enum FileEngineTypeState {
     Async,
     /// Threaded File Engine.
     Threaded,
+    /// NBD File Engine.
+    Nbd,
 }
 
 impl From<FileEngineType> for FileEngineTypeState {
@@ -40,6 +43,7 @@ impl From<FileEngineType> for FileEngineTypeState {
             FileEngineType::Sync => FileEngineTypeState::Sync,
             FileEngineType::Async => FileEngineTypeState::Async,
             FileEngineType::Threaded => FileEngineTypeState::Threaded,
+            FileEngineType::Nbd => FileEngineTypeState::Nbd,
         }
     }
 }
@@ -50,6 +54,7 @@ impl From<FileEngineTypeState> for FileEngineType {
             FileEngineTypeState::Sync => FileEngineType::Sync,
             FileEngineTypeState::Async => FileEngineType::Async,
             FileEngineTypeState::Threaded => FileEngineType::Threaded,
+            FileEngineTypeState::Nbd => FileEngineType::Nbd,
         }
     }
 }
@@ -65,6 +70,9 @@ pub struct VirtioBlockState {
     pub virtio_state: VirtioDeviceState,
     rate_limiter_state: RateLimiterState,
     file_engine_type: FileEngineTypeState,
+    /// The NBD server the drive is served from, with the NBD engine.
+    #[serde(default)]
+    nbd: Option<NbdBackendConfig>,
 }
 
 impl Persist<'_> for VirtioBlock {
@@ -83,6 +91,7 @@ impl Persist<'_> for VirtioBlock {
             virtio_state: VirtioDeviceState::from_device(self),
             rate_limiter_state: self.rate_limiter.save(),
             file_engine_type: FileEngineTypeState::from(self.file_engine_type()),
+            nbd: self.disk.nbd.clone(),
         }
     }
 
@@ -95,11 +104,16 @@ impl Persist<'_> for VirtioBlock {
             .map_err(VirtioBlockError::RateLimiter)?;
         rate_limiter.set_min_refill_delay(RATE_LIMITER_MIN_REFILL_DELAY);
 
-        let disk_properties = DiskProperties::new(
-            state.disk_path.clone(),
-            is_read_only,
-            state.file_engine_type.into(),
-        )?;
+        let disk_properties = match (state.file_engine_type, &state.nbd) {
+            // Connect to the server again; it serves what the snapshot's guest wrote.
+            (FileEngineTypeState::Nbd, Some(nbd)) => {
+                DiskProperties::new_nbd(nbd.clone(), state.disk_path.clone())?
+            }
+            (FileEngineTypeState::Nbd, None) => return Err(VirtioBlockError::Config),
+            (engine, _) => {
+                DiskProperties::new(state.disk_path.clone(), is_read_only, engine.into())?
+            }
+        };
 
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
 
@@ -169,6 +183,7 @@ mod tests {
             cache_type: CacheType::Writeback,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
+            nbd: None,
         };
 
         let block = VirtioBlock::new(config).unwrap();
@@ -213,6 +228,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
+            nbd: None,
         };
 
         let block = VirtioBlock::new(config).unwrap();

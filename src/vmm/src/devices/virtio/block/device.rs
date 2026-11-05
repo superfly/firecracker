@@ -82,6 +82,14 @@ impl Block {
         }
     }
 
+    /// Get the device ready for a snapshot, or fail the snapshot. See `VirtioBlock::quiesce`.
+    pub fn quiesce(&mut self) -> Result<(), BlockError> {
+        match self {
+            Self::Virtio(b) => b.quiesce().map_err(BlockError::VirtioBackend),
+            Self::VhostUser(_) => Ok(()),
+        }
+    }
+
     pub fn prepare_save(&mut self) {
         match self {
             Self::Virtio(b) => b.prepare_save(),
