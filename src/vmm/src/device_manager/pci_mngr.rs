@@ -7,7 +7,7 @@ use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
-use log::{debug, error, warn};
+use log::{debug, error};
 use serde::{Deserialize, Serialize};
 
 use super::persist::MmdsState;
@@ -310,21 +310,14 @@ impl<'a> Persist<'a> for PciDevices {
                         .as_mut_any()
                         .downcast_mut::<Block>()
                         .unwrap();
-                    if block_dev.is_vhost_user() {
-                        warn!(
-                            "Skipping vhost-user-block device. VhostUserBlock does not support \
-                             snapshotting yet"
-                        );
-                    } else {
-                        block_dev.prepare_save();
-                        let device_state = block_dev.save();
-                        state.block_devices.push(VirtioDeviceState {
-                            device_id: block_dev.id().to_string(),
-                            pci_device_bdf,
-                            device_state,
-                            transport_state,
-                        });
-                    }
+                    block_dev.prepare_save();
+                    let device_state = block_dev.save();
+                    state.block_devices.push(VirtioDeviceState {
+                        device_id: block_dev.id().to_string(),
+                        pci_device_bdf,
+                        device_state,
+                        transport_state,
+                    });
                 }
                 virtio_ids::VIRTIO_ID_NET => {
                     let net_dev = locked_virtio_dev

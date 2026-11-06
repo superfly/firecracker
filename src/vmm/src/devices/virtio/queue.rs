@@ -398,6 +398,17 @@ impl Queue {
         }
     }
 
+    /// Get UsedRing.idx
+    pub fn used_ring_idx_get(&self) -> u16 {
+        // SAFETY: `idx` is 1 u16 away from the start
+        unsafe {
+            self.used_ring_ptr
+                .add(std::mem::size_of::<u16>())
+                .cast::<u16>()
+                .read_volatile()
+        }
+    }
+
     /// Set UsedRing.idx
     #[inline(always)]
     pub fn used_ring_idx_set(&mut self, val: u16) {

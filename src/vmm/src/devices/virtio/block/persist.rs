@@ -18,10 +18,17 @@ pub enum BlockState {
 }
 
 impl BlockState {
+    /// Whether the device is served by a vhost-user backend.
+    pub fn is_vhost_user(&self) -> bool {
+        matches!(self, BlockState::VhostUser(_))
+    }
+
     pub fn is_activated(&self) -> bool {
         match self {
             BlockState::Virtio(virtio_block_state) => virtio_block_state.virtio_state.activated,
-            BlockState::VhostUser(vhost_user_block_state) => false,
+            BlockState::VhostUser(vhost_user_block_state) => {
+                vhost_user_block_state.virtio_state.activated
+            }
         }
     }
 }

@@ -197,9 +197,30 @@ exhaustion.
 
 ## Snapshot support
 
-At the moment, [snapshotting](../snapshotting) is not supported for microVMs
-that have vhost-user devices configured. An attempt to take a snapshot of such a
-microVM will fail. It is planned to add support for that in the future.
+vhost-user block devices can be [snapshotted](../snapshotting) and restored,
+with these constraints:
+
+- While the snapshot is taken, Firecracker stops each ring with
+  `VHOST_USER_GET_VRING_BASE`. The backend must stop taking requests, complete
+  every request it already took into the used ring, and only then reply. The
+  reply is the next available index the backend would have processed, and is
+  saved in the snapshot. A backend that wants data durable across the snapshot
+  should also flush before replying. If the same microVM is resumed after the
+  snapshot, Firecracker hands the rings back to the backend at that index.
+- The backend's state is not part of the snapshot. On restore Firecracker
+  connects to the socket in the snapshot again, negotiates the same features
+  and protocol features as before (restore fails if the backend no longer
+  offers them), shares guest memory and hands the rings over at the saved
+  index. The backend at that socket can be the same process or a new one.
+- A vhost-user backend needs guest memory backed by a file descriptor it can
+  map. When restoring from a `File` memory backend, Firecracker copies the
+  snapshot's memory file into a memfd before the microVM starts, so restore
+  time grows with guest memory size. Firecracker logs how long the copy took.
+  Restoring with the `Uffd` memory backend is not supported for microVMs with
+  vhost-user devices.
+- Once resumed, Firecracker raises each vhost-user block device's queue
+  interrupt once, so the guest sees completions the backend wrote after the
+  vCPUs were saved.
 
 ## Example configuration
 

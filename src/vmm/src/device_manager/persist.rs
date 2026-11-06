@@ -7,7 +7,7 @@ use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
-use log::{error, warn};
+use log::error;
 use serde::{Deserialize, Serialize};
 
 use super::acpi::ACPIDeviceManager;
@@ -298,21 +298,14 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 // Both virtio-block and vhost-user-block share same device type.
                 virtio_ids::VIRTIO_ID_BLOCK => {
                     let block = locked_device.as_mut_any().downcast_mut::<Block>().unwrap();
-                    if block.is_vhost_user() {
-                        warn!(
-                            "Skipping vhost-user-block device. VhostUserBlock does not support \
-                             snapshotting yet"
-                        );
-                    } else {
-                        block.prepare_save();
-                        let device_state = block.save();
-                        states.block_devices.push(VirtioDeviceState {
-                            device_id,
-                            device_state,
-                            transport_state,
-                            device_info,
-                        });
-                    }
+                    block.prepare_save();
+                    let device_state = block.save();
+                    states.block_devices.push(VirtioDeviceState {
+                        device_id,
+                        device_state,
+                        transport_state,
+                        device_info,
+                    });
                 }
                 virtio_ids::VIRTIO_ID_NET => {
                     let net = locked_device.as_mut_any().downcast_mut::<Net>().unwrap();
@@ -515,7 +508,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             restore_helper(
                 device.clone(),
                 block_state.device_state.is_activated(),
-                false,
+                block_state.device_state.is_vhost_user(),
                 device,
                 &block_state.device_id,
                 &block_state.transport_state,

@@ -51,6 +51,8 @@ pub enum VhostUserError {
     VhostUserSetVringKick(VhostError),
     /// Set vring enable failed: {0}
     VhostUserSetVringEnable(VhostError),
+    /// Get vring base failed: {0}
+    VhostUserGetVringBase(VhostError),
     /// Failed to read vhost eventfd: No memory region found
     VhostUserNoMemoryRegion,
     /// Invalid used address
@@ -108,6 +110,11 @@ pub trait VhostUserHandleBackend: Sized {
 
     /// Sets the base offset in the available vring.
     fn set_vring_base(&self, _queue_index: usize, _base: u16) -> Result<(), vhost::Error> {
+        unimplemented!()
+    }
+
+    /// Stops the vring and returns the next available index the backend would process.
+    fn get_vring_base(&self, _queue_index: usize) -> Result<u32, vhost::Error> {
         unimplemented!()
     }
 
@@ -209,6 +216,11 @@ impl VhostUserHandleBackend for Frontend {
     /// Sets the base offset in the available vring.
     fn set_vring_base(&self, queue_index: usize, base: u16) -> Result<(), vhost::Error> {
         <Frontend as VhostBackend>::set_vring_base(self, queue_index, base)
+    }
+
+    /// Stops the vring and returns the next available index the backend would process.
+    fn get_vring_base(&self, queue_index: usize) -> Result<u32, vhost::Error> {
+        <Frontend as VhostBackend>::get_vring_base(self, queue_index)
     }
 
     /// Set the event file descriptor to signal when buffers are used.
@@ -402,7 +414,19 @@ impl<T: VhostUserHandleBackend> VhostUserHandleImpl<T> {
     ) -> Result<(), VhostUserError> {
         // Provide the memory table to the backend.
         self.update_mem_table(mem)?;
+        self.setup_vrings(mem, queues, interrupt)
+    }
 
+    /// Send the backend everything it needs to serve the vrings, and enable them.
+    ///
+    /// Each ring starts at the queue's `next_avail`: zero on a fresh device, and the index the
+    /// backend returned from `GET_VRING_BASE` on a device that was stopped for a snapshot.
+    pub fn setup_vrings(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        queues: &[(usize, &Queue, &EventFd)],
+        interrupt: Arc<dyn VirtioInterrupt>,
+    ) -> Result<(), VhostUserError> {
         // Send set_vring_num here, since it could tell backends, like SPDK,
         // how many virt queues to be handled, which backend required to know
         // at early stage.
@@ -434,7 +458,7 @@ impl<T: VhostUserHandleBackend> VhostUserHandleImpl<T> {
                 .set_vring_addr(*queue_index, &config_data)
                 .map_err(VhostUserError::VhostUserSetVringAddr)?;
             self.vu
-                .set_vring_base(*queue_index, queue.avail_ring_idx_get())
+                .set_vring_base(*queue_index, queue.next_avail.0)
                 .map_err(VhostUserError::VhostUserSetVringBase)?;
 
             // No matter the queue, we set irq_evt for signaling the guest that buffers were
@@ -463,6 +487,18 @@ impl<T: VhostUserHandleBackend> VhostUserHandleImpl<T> {
         }
 
         Ok(())
+    }
+
+    /// Stop a vring and return the index of the next available descriptor the backend has not
+    /// taken. A backend replies only once every request it took has completed, so everything
+    /// before that index is in the used ring.
+    pub fn stop_vring(&self, queue_index: usize) -> Result<u16, VhostUserError> {
+        let base = self
+            .vu
+            .get_vring_base(queue_index)
+            .map_err(VhostUserError::VhostUserGetVringBase)?;
+        // The ring index is 16 bits wide; the message field is wider.
+        Ok((base & 0xffff) as u16)
     }
 }
 
@@ -911,6 +947,9 @@ pub(crate) mod tests {
         queue.ready = true;
         queue.size = queue.max_size;
         queue.initialize(&guest_memory).unwrap();
+        // As a queue restored from a snapshot: the backend resumes where it stopped, not at the
+        // guest's available index.
+        queue.next_avail = std::num::Wrapping(42);
 
         let event_fd = EventFd::new(0).unwrap();
 
@@ -940,7 +979,7 @@ pub(crate) mod tests {
                     .unwrap() as u64,
                 log_addr: None,
             },
-            base: queue.avail_ring_idx_get(),
+            base: 42,
             call: interrupt
                 .notifier(VirtioInterruptType::Queue(0u16))
                 .as_ref()
@@ -983,5 +1022,29 @@ pub(crate) mod tests {
         assert_eq!(result[0].call, expected_config.call);
         assert_eq!(result[0].kick, expected_config.kick);
         assert_eq!(result[0].enable, expected_config.enable);
+    }
+
+    #[test]
+    fn test_stop_vring() {
+        struct MockFrontend {
+            stopped: std::cell::UnsafeCell<Vec<usize>>,
+        }
+
+        impl VhostUserHandleBackend for MockFrontend {
+            fn get_vring_base(&self, queue_index: usize) -> Result<u32, vhost::Error> {
+                unsafe { (*self.stopped.get()).push(queue_index) };
+                // Wider than a ring index, as the message field is.
+                Ok(0x1_0007)
+            }
+        }
+
+        let vuh = VhostUserHandleImpl {
+            vu: MockFrontend {
+                stopped: std::cell::UnsafeCell::new(vec![]),
+            },
+            socket_path: "".to_string(),
+        };
+        assert_eq!(vuh.stop_vring(0).unwrap(), 7);
+        assert_eq!(unsafe { &*vuh.vu.stopped.get() }, &vec![0]);
     }
 }
