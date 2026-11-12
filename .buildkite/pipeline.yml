@@ -8,10 +8,13 @@ steps:
       - aws s3 cp build/cargo_target/x86_64-unknown-linux-musl/release/jailer s3://flyio-builds/firecracker/${BUILDKITE_BRANCH}-${BUILDKITE_COMMIT}/jailer --region us-east-2 &
       - wait
       # Also publish a deployctl bundle for fcm-layers: root-owned bin/firecracker
-      # and bin/jailer, then HEAD once the bundle is in place.
+      # and bin/jailer, VERSION for flyd's config, then HEAD once the bundle is
+      # in place.
       - mkdir -p bundle/bin
       - install -m 0755 build/cargo_target/x86_64-unknown-linux-musl/release/firecracker build/cargo_target/x86_64-unknown-linux-musl/release/jailer bundle/bin/
-      - tar --owner=0 --group=0 -C bundle -czf bundle.tar.gz bin
+      - bundle/bin/firecracker --version | sed -n 's/^Firecracker v//p' > bundle/VERSION
+      - test -s bundle/VERSION
+      - tar --owner=0 --group=0 -C bundle -czf bundle.tar.gz bin VERSION
       - aws s3 cp bundle.tar.gz s3://flyio-builds/firecracker/${BUILDKITE_BRANCH}/${BUILDKITE_COMMIT}.tar.gz --region us-east-2
       - printf '%s' "${BUILDKITE_COMMIT}" | aws s3 cp - s3://flyio-builds/firecracker/${BUILDKITE_BRANCH}/HEAD --region us-east-2
     agents:
